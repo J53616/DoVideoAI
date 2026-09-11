@@ -2,7 +2,7 @@
   <h2>DoVideoAI</h2>
   
   <p>
-    <a href="https://github.com/Xiaoc7r/DOVideo-AI/stargazers"><img src="https://img.shields.io/github/stars/Xiaoc7r/DOVideo-AI?style=flat-square" alt="GitHub Stars"></a>
+    <a href="https://github.com/J53616/DoVideoAI/stargazers"><img src="https://img.shields.io/github/stars/J53616/DoVideoAI?style=flat-square" alt="GitHub Stars"></a>
     <img src="https://img.shields.io/badge/Java-21-E76F00?style=flat-square" alt="Java 21">
     <img src="https://img.shields.io/badge/Spring%20Boot-3.5.9-6DB33F?style=flat-square" alt="Spring Boot 3.5.9">
     <img src="https://img.shields.io/badge/Vue-3-42B883?style=flat-square" alt="Vue 3">
@@ -39,9 +39,9 @@
 
 **Agent 分析结果**
 
-<img width="2886" height="1656" alt="b89cf519f7189cf823507d5c17b0d88d" src="https://github.com/user-attachments/assets/8bfeed0e-28df-4527-86bf-e549f5516dcc" />
+![DoVideoAI Agent 分析结果](docs/images/agent-result.png)
 
-<img width="1776" height="1708" alt="a52abccc6447591c6f9a66ad948c5709" src="https://github.com/user-attachments/assets/9e04ecca-a2a5-4d59-89d7-8f4329858070" />
+![DoVideoAI Agent 执行计划](docs/images/video-agent-demo.png)
 
 
 
