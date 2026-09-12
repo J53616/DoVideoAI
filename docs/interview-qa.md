@@ -1,10 +1,6 @@
 # DoVideoAI 面试问答
 
 > 本文档所有数字与实现口径均以当前代码为准。
->
-> **「代码细节」小节约定**：给出可以直接引用的类名、方法名、常量、字段名和 Key 格式，用于回答
-> 「具体怎么实现的」。引用格式为 `类名:行号`，类名相对 `server/src/main/java/com/example/server/`。
-> 与本文其他段落口径冲突时，以「代码细节」小节为准（代码是唯一真源）。
 
 ---
 
@@ -18,51 +14,7 @@ DoVideoAI 是我用 AI Coding 辅助开发的长视频内容理解平台。用�
 
 我的核心思路是先把视频加工成可复用、可追溯的证据资产，再让 Agent 在明确的证据、状态和预算边界内完成目标驱动分析，而不是把完整视频直接丢给模型碰运气。
 
-**代码细节：技术栈和代码规模**
-
-后端 **Java 21**（`pom.xml` 的 `<java.version>21</java.version>`）+ Spring Boot，
-`server/src/main/java/com/example/server/` 下 **86 个 Java 文件、约 8.5 千行**。
-模块划分（顶层包文件数）：
-
-| 包 | 文件数 | 内容 |
-| :--- | :--- | :--- |
-| `service`（含 `service/mode`） | 27 + 4 | 业务主逻辑 |
-| `dto` | 21 | record 为主的入参出参 |
-| `controller` | 7 | HTTP / SSE 入口 |
-| `utils` | 7 | ASR / OCR / Embedding / DeepSeek / MinIO / Key 工具 |
-| `config` | 5 | 线程池、MinIO、鉴权拦截、Web |
-| `mapper` / `repository` | 4 + 1 | MyBatis Mapper 与 Checkpoint 仓储 |
-| `common` / `exception` | 3 + 2 | 统一返回、错误码、业务异常 |
-| `entity` | 3 | `User` / `MediaFile` / `FailedAnalysisTask` |
-| `consumer` | 1 | `VideoAnalysisConsumer` |
-| 根 | 1 | `ServerApplication` |
-
-`pom.xml` 里的关键依赖：`langchain4j-open-ai`（用 `OpenAiChatModel` 接 OpenAI 兼容网关）、
-`redisson-spring-boot-starter`（分布式锁 + `RRateLimiter`）、
-`rocketmq-spring-boot-starter`、`mybatis-plus-spring-boot3-starter`、
-`flyway-core` + `flyway-mysql`、`minio`、`okhttp`、`fastjson2`、`lombok`。
-
-**没有 Qdrant SDK 依赖**——Qdrant 是直接用 OkHttp 打 REST 接口
-（`QdrantVectorStore` 里手写 `/collections/{c}/points/query` 等路径）。
-ASR 和 Embedding 同样走 OkHttp 直连，只有 LLM 走了 LangChain4j。
-这个取舍值得说：Qdrant 只用到三个接口（建集合、写点、查点），引 SDK 的收益不如自己控制超时和错误语义。
-
-外部依赖的具体型号：LLM 默认 `deepseek-ai/DeepSeek-V3.2`（`ai.deepseek.model`）、
-Embedding `BAAI/bge-m3`（`ai.embedding.model`，1024 维）、
-ASR `TeleAI/TeleSpeechASR`（`ai.asr.model`）、
-本地 OCR 是 tesseract 命令行加 `chi_sim+eng` 语言包。
-LLM / Embedding / ASR 三家都走同一个 SiliconFlow 兼容网关（`ai.deepseek.base-url`）。
-
-**代码细节：模型调用的重试和超时，与文档其他处口径对齐**
-
-`OpenAiChatModel` 构造时显式设了 `.maxRetries(0)`（`DeepSeekUtils.java:74-82`），
-把重试收回到自己的 `chat()` 里，避免 SDK 内部重试和应用重试叠乘。
-超时是 `ai.deepseek.timeout-seconds`，默认 **300 秒**，
-且每次调用的实际超时是 `min(300 秒, AgentExecutionBudget 剩余时间)`——
-这是 Q18 里「时长预算能在模型调用内部生效」的实现。
-构造器还有两条启动期校验（`:66-72`）：超时必须 ≥1、价格必须 ≥0，
-且**如果配了 `max-estimated-cost > 0` 但价格是 0，直接抛异常拒绝启动**，
-防止费用预算看起来配了实际永远不生效。
+模型网关的配置在启动期就做校验——如果配了费用预算却没有配真实单价，直接拒绝启动，避免预算看起来生效、实际永远不生效。
 
 ### Q2：解析结果具体产出什么？
 
@@ -113,24 +65,6 @@ LLM / Embedding / ASR 三家都走同一个 SiliconFlow 兼容网关（`ai.deeps
 9. Critic 不通过 → 定向补证据或改计划，最多两轮
 10. 结果写 MySQL（Checkpoint 真源）+ Redis（7 天热缓存）→ SSE 推阶段与终态 → 前端展示，可继续追问
 ```
-
-**代码细节：这条链路对应的接口和落点**
-
-| 阶段 | 接口 / 方法 | 关键落点 |
-| :--- | :--- | :--- |
-| 初始化上传 | `POST /media/init-upload` | `upload:chunked:{uploadId}` Hash，TTL 1 天 |
-| 上传分片 | `POST /media/upload-chunk` | MinIO `chunk-uploads/{uploadId}/part-{i}` + Redis Set `:parts` |
-| 合并 | `POST /media/complete-upload` | 锁 `lock:upload:merge:{uploadId}` → `media_files` 记录 |
-| 模式路由 | `POST /analysis/route` | 返回 `RouteDecision{mode, reason}`，AUTO 不落到后端 |
-| 提交分析 | `POST /analysis/ai?id=&goal=&mode=` | 202 → 投递 `video-analysis-topic` |
-| 进度推送 | `GET /analysis/analysis-events`（SSE） | 事件名 `task-status`，载荷 `TaskEvent{state,result,message,stage}` |
-| 修订重跑 | `POST /analysis/agent-revise` | 带 `revision=true` 的消息，切 Checkpoint |
-| 证据检索 | `GET /analysis/evidence-search?id=&query=` | `List<VideoEvidenceHit>` |
-| 追问 | `POST /analysis/follow-up` | 复用视频级 Checkpoint，只重算目标级 |
-| Trace | `GET /analysis/agent-trace` | `agent:trace:{traceId}`，TTL 7 天 |
-
-入口在 `controller/AnalysisController.java:100`（提交）、`:199`（SSE）、`:157`（修订）；
-`controller/MediaController.java:41-65`（分片上传三件套）。
 
 ### Q4：这个项目真正解决的用户问题 / 难点是什么？
 
@@ -183,29 +117,10 @@ tesseract <图片绝对路径> stdout -l chi_sim+eng
 
 我的选型原则是中文视频效果、成本、接入复杂度和结果可追溯性。ASR 通过托管接口调用 TeleSpeechASR，并按 60 秒切片获得稳定的分钟级时间范围；OCR 使用本地 Tesseract，适合字幕、PPT 和代码文字，复杂图表不是它的能力边界。Embedding 使用 BGE-M3，负责用户目标和 Chunk 摘要的语义相似度。Planner、Executor、Critic 通过 LangChain4j 接入 OpenAI 兼容网关上的 DeepSeek 系列模型。
 
-**代码细节：型号和调用方式**
+OCR 这一层不做去重，也没有任何图像增强（灰度化、二值化、去噪），
+所以低对比度 PPT 或小字号代码的识别质量完全取决于 Tesseract 的默认行为。
 
-| 能力 | 型号 / 实现 | 配置项 | 调用方式 |
-| :--- | :--- | :--- | :--- |
-| LLM | `deepseek-ai/DeepSeek-V3.2` | `ai.deepseek.model` | LangChain4j `OpenAiChatModel` |
-| Embedding | `BAAI/bge-m3`（1024 维） | `ai.embedding.model` | OkHttp `POST {base-url}/embeddings` |
-| ASR | `TeleAI/TeleSpeechASR` | `ai.asr.model` | OkHttp multipart，字段 `file` + `model` |
-| OCR | 本地 tesseract 命令行 | `tool.ocr.command` | `tesseract <img> stdout -l chi_sim+eng` |
-
-LLM、Embedding、ASR **共用同一个 OpenAI 兼容网关**（`ai.deepseek.base-url`
-默认 `https://api.siliconflow.cn/v1`，即 SiliconFlow），
-所以三者共享一份 API Key（`ai.deepseek.api-key`）。
-
-OCR 的具体调用（`utils/OcrUtils.java:31-35`）是
-`tesseract <图片绝对路径> stdout -l chi_sim+eng`，输出重定向到临时文件再读回。
-**没有传 `--psm`，也没有做图像预处理，不解析置信度**——OCR 文本原样入库。
-超时是 `process.waitFor(2, TimeUnit.MINUTES)`（`:36-39`），超时后 `destroyForcibly`。
-
-这里有个要主动说的边界：Q24 提到 dHash 去重，但**去重发生在 OCR 之前**，
-`OcrUtils` 自己不感知重复；也没有任何图像增强（灰度化、二值化、去噪），
-所以低对比度 PPT 或小字号代码的识别质量完全取决于 tesseract 的默认行为。
-
-这四类能力都被封装在各自边界里。ASR 或 OCR 单路失败可以保留另一条证据；Embedding 或 Qdrant 不可用可以回退本地排序；LLM 输出必须经过结构和证据校验。这样更换模型时主要影响适配层和版本缓存，不需要重写 VideoContext、Agent 状态和业务流程。
+这些能力都被封装在各自的边界里。ASR 或 OCR 单路失败可以保留另一条证据；Embedding 或 Qdrant 不可用可以回退本地排序；LLM 输出必须经过结构和证据校验。这样更换模型时主要影响适配层和版本缓存，不需要重写 VideoContext、Agent 状态和业务流程。
 
 ### Q7：主要数据分别存在哪里？为什么这样分？
 
@@ -215,22 +130,6 @@ OCR 的具体调用（`utils/OcrUtils.java:31-35`）是
 | MinIO | 完整视频、上传分片、关键帧 | 大二进制对象 |
 | Redis | 上传进度、activeKey、限流状态、Checkpoint 热缓存、Trace、短期反馈 | 热数据 / 临时状态 |
 | Qdrant | 按视频隔离的 Chunk 向量 | 语义召回 |
-
-**代码细节：每一类数据的具体落点**
-
-| 存储 | 表 / 对象 / Key |
-| :--- | :--- |
-| MySQL | `media_files`（含 `content_hash VARCHAR(64)`，`idx_media_content_hash` 普通索引）、`agent_checkpoints`（主键 `media_id + checkpoint_key`）、失败分析任务表 |
-| MinIO | 完整视频（`media_files.file_path`）、上传分片 `chunk-uploads/{uploadId}/part-{i}`、关键帧前缀 `evidence-frames` |
-| Redis | `upload:chunked:{uploadId}` / `:parts` / `:completed`；`analysis:active\|completed\|attempts\|context-owner:{...}`；`lock:analysis:{...}`；`limit:ai:user:{userId}` / `limit:ai:global`；`media:md5:{mediaId}`；`agent:checkpoint:{mediaId}`；`agent:feedback:{mediaId}`；`agent:trace:{traceId}` |
-| Qdrant | 单集合 `video_chunks`（`vector.qdrant.collection`），**不是每个视频一个集合**；按 payload 的 `mediaId` 字段过滤做隔离 |
-
-隔离方式值得单独说：Qdrant 里只有一个集合，检索时用
-`filter.must[{key:"mediaId", match:{value:mediaId}}]` 限定范围（`QdrantVectorStore.java:87-99`）。
-这样避免为每个视频建集合导致集合数量爆炸，代价是过滤依赖 payload 索引。
-
-Qdrant 的向量维度**没有写死**，由第一次写入的 embedding 长度动态建集合
-（`QdrantVectorStore.java:58`），距离度量固定 `Cosine`（`:163`）。BGE-M3 实际是 1024 维。
 
 最重要的不是用了几个存储，而是冷热和事实边界：Redis 丢失只应该影响性能，不能让用户任务永久丢失；Qdrant 不可用只影响语义召回，不能阻断分析链路；大型二进制对象不进入 MySQL；最终状态不能只放缓存。
 
@@ -291,35 +190,6 @@ AI 帮我缩短了编码和方案搜索时间，但它不会替我确定业务�
 
 准确措辞是**受控 Video Agent Workflow**：模型负责开放式理解和判断，程序负责工具边界、状态、预算、重试与终止。它没有完全自治，但在视频分析这个确定业务里已经具备目标、计划、工具、反馈和循环。
 
-**代码细节：Agent 状态的字段**
-
-状态本体就是 `dto/AgentState.java` 这个 record，只有五个字段：
-
-```java
-record AgentState(String goal, AgentPlan plan, AnalysisResult result,
-                  CriticResult critique, int round)
-
-record AgentPlan(String understoodGoal, List<String> tasks)
-
-record CriticResult(boolean passed, List<String> feedback,
-                    List<String> missingRequirements,
-                    List<String> unsupportedClaims,
-                    List<Long> requiredTimestamps)
-```
-
-产物字段来自 `dto/AnalysisResult.java`：
-
-```java
-record AnalysisResult(String title, List<String> conclusions, List<Evidence> evidence,
-                      List<String> suggestions, List<Section> sections)
-
-record Evidence(long timestampMs, String source, String content, String claim)
-record Section(String key, String title, List<String> items)
-```
-
-`round` 是当前轮次，`result != null && critique == null` 正好表示「Executor 草稿已生成但还没校验」，
-这就是下面 Q41 里「从 Critic 继续」的判据（`AgentLoopService.java:127`）。
-
 ### Q12：Planner、Executor、Critic 和确定性程序分别负责什么？
 
 | 角色 | 职责 | 约束 |
@@ -345,37 +215,11 @@ record Section(String key, String title, List<String> items)
 6. 进入下一轮，直到通过或达到终止条件（轮数 / 时长 / Token / 费用）
 ```
 
-**代码细节：编排方法**
-
-主入口 `AgentLoopService.run(mediaId, context, profile)`（`AgentLoopService.java:75`），
-内部 `runWithinBudget`（`:89`）按顺序做五件事：
-
-| 步骤 | 方法 | 行号 |
-| :--- | :--- | :--- |
-| 读终态 Checkpoint 并校验合法性 | `isPlanValid` / `isResultValid` | `:96-107` |
-| 目标级粗召回 | `LongVideoContextService.selectRelevant` | `:109` |
-| 解析或复用 Plan | `resolvePlan` | `:154` |
-| 执行一轮（Executor + Critic） | `executeRound` → `critiqueRound` | `:179` / `:199` |
-| 按 Critic 反馈改上下文和计划 | `contextForRetry` / `revisePlanForRetry` | `:367` / `:391` |
-
-上下文变化的分流点在 `contextForRetry`（`:367-382`）：`requiresEvidenceRefresh` 为真才调用
-`refineForCritique` 重新检索，否则直接沿用当前上下文（`criticRewriteOnlyRetries`）。
-这正是 Q16 说的「上下文没有变化的循环不算有效修正」在代码里的位置。
-
 ### Q14：Planner 怎样保证任务可以执行？
 
 Planner 有三条边界。任务必须能由当前视频证据完成，不能生成「搜索互联网评价」这种系统没有工具支持的任务；任务必须足够具体，后续能判断完成与否；任务数量被程序限制在 1 到 5 条，避免把一次视频分析拆成不可控的长计划。
 
 如果 Planner 返回空任务、过长任务或缺少目标理解，系统会调用一次计划修复；Critic 后续发现目标遗漏时，会把 missingRequirements 交回 Planner 修订。修订失败时保留旧计划继续处理，避免一次重规划错误破坏已有结果。
-
-**代码细节：Planner 的三条边界落在哪**
-
-- 任务数上限：`AgentLoopService.MAX_PLAN_TASKS = 5`（`:24`）。
-- 任务可执行性：`isPlanValid`（`:251-257`）要求 `understoodGoal` 非空、`tasks` 非空且 ≤5、
-  每个任务非空且长度 ≤500。注意这里**只能校验结构，不能校验任务是否真的可由当前视频证据完成**——
-  那条边界靠 Prompt 约束 + Critic 事后纠偏，不是程序强校验，这点要讲准确。
-- 一次修复：`resolvePlan`（`:163-171`）在 Plan 非法时调用 `deepSeekUtils.repairPlan`，
-  并计 `planStructureRepairs`。
 
 当前 Plan 只有目标理解和任务列表，没有「语音依赖 / 视觉依赖」这样的字段，不能把这类设计设想说成已实现。另外要讲准确：Planner 确实拆出了多个任务，但第一版没有为每个任务启动独立 Executor 或子 Agent，而是一个受约束的 Executor 在一次调用中完成整份计划，减少调用和状态编排成本。
 
@@ -390,26 +234,6 @@ Planner 有三条边界。任务必须能由当前视频证据完成，不能生
    - 证据原文经过规范化（去标点、符号、空白并统一小写）后，是原文的**包含关系**。
 3. **语义支持**：由 LLM Critic 判断证据是否足以推出结论、是否遗漏目标、是否存在逻辑冲突。这是唯一不能确定性保证的一层。
 
-**代码细节：前两层就是 `EvidenceVerificationService` 的三个方法**
-
-```java
-boolean timestampCovered(VideoContext, Evidence)   // 时间戳落在 [startMs, endMs) 内，左闭右开
-boolean supported(VideoContext, Evidence)          // 来源 + 原文包含关系
-boolean supportsClaim(VideoContext, claim, Evidence)// 先做 claim 等值，再委托 supported
-```
-
-逐个说清：
-
-- **结构绑定**在 `supportsClaim`（`EvidenceVerificationService.java:28-35`）：
-  `normalize(claim).equals(normalize(evidence.claim()))`，两边都归一化后必须完全相等。
-- **来源校验**在 `supported`（`:17-26`）：`source` 转大写后必须含 `ASR` 或 `OCR`，
-  否则直接 false。然后按来源拼出候选原文——只含 ASR 就只给 `transcript`，只含 OCR 就只给
-  `String.join(" ", ocrTexts)`，两者都有才合并（`sourceText`，`:41-47`）。
-- **原文包含**在 `textMatches`（`:49-55`）：**方向是「原文包含证据」，不是「证据包含原文」**，
-  即 `normalize(candidate).contains(normalize(evidence))`。
-- **归一化**（`:57-61`）：`toLowerCase(ROOT)` 后 `replaceAll("[\\p{P}\\p{S}\\s]+", "")`，
-  也就是去掉所有标点、符号和空白。
-
 这个方向性有个直接后果值得主动讲：证据文本越短越容易通过，所以 Critic 的程序兜底只能拦住
 「伪造原文」和「张冠李戴」，**拦不住「拿一句真实但不相关的原文去支持一个过强的结论」**——
 后者只能靠 LLM Critic 的语义层。
@@ -417,32 +241,6 @@ boolean supportsClaim(VideoContext, claim, Evidence)// 先做 claim 等值，再
 前两层可以稳定拦截伪造时间戳、错误来源和不存在的原文；第三层仍然存在模型误判。因此我**不会说 Claim 校验消除了幻觉**，而会说它把无依据结论变成了可检测、可追踪、可重试的问题。
 
 Critic 与 Executor 使用同一模型确实可能共享盲区，所以质量不能完全交给模型自检。当前方案用程序规则兜住结构和证据存在性，再由 Critic 处理语义；质量要求更高时可以换不同 Critic 模型或扩大人工评测集，但第一版不为了 Multi-Agent 形式增加成本。
-
-**代码细节：每个节点向模型要的确切 JSON 字段**
-
-这是最有说服力的「我确实控制了模型输出」的证据。所有 Prompt 都在 `utils/DeepSeekUtils.java`，
-每个节点都有自己的 stage 名，并要求返回严格 JSON：
-
-| 节点 | stage | 要求的 JSON 字段 |
-| :--- | :--- | :--- |
-| Planner / Replan / 计划修复 | `PLANNER` / `REPLANNER` / `PLANNER_REPAIR` | `{"understoodGoal": "...", "tasks": ["任务1", ...]}` |
-| 检索意图 | `RETRIEVAL_PLANNER` | `{"semanticQuery": "...", "keywords": [...], "visualKeywords": [...]}` |
-| 模式路由 | `MODE_ROUTER` | `{"mode": "GENERAL", "reason": "..."}` |
-| Chunk 摘要 | `CHUNK_SUMMARY` | `{"segmentSummary": "...", "keywords": [...]}` |
-| Executor | `EXECUTOR` | `{"title", "conclusions", "evidence":[{"timestampMs","source","content","claim"}], "suggestions"}`，有模式指令时**额外**要求顶层 `"sections":[{"key","title","items"}]` |
-| Critic | `CRITIC` | `{"passed", "feedback", "missingRequirements", "unsupportedClaims", "requiredTimestamps"}` |
-
-几个值得主动讲的点：
-
-- `evidence.source` 被 Prompt 限定为 **`ASR` / `OCR` / `ASR+OCR`** 三选一，
-  正好对应 `EvidenceVerificationService.supported` 里 `source.contains("ASR")` 的判断。
-- Executor 的 `sections` 是**条件要求**的：`executeSuffix`（`:357-363`）只在传了模式指令时
-  追加这段要求。所以 GENERAL 模式不产生 sections，`requiredSectionKeys` 也是空的
-  （见 Q19 表格），两边是配套的。
-- Critic 的 Prompt 要求 `requiredTimestamps` 在**不需要补证据时返回空数组**——
-  这个约束很关键，因为 `requiresEvidenceRefresh`（`AgentLoopService:384-389`）
-  把「非空」直接当作「需要刷新上下文」的触发条件，模型随手填充时间戳会导致每轮都重新检索。
-- 所有调用都带同一个 `SYSTEM_POLICY` 系统消息（`:37-45`），把用户内容标记为**不可信证据**。
 
 ### Q16：Critic 不通过后，系统怎样真正改变下一轮？
 
@@ -465,49 +263,11 @@ Critic 必须返回结构化失败原因，程序按类型分流：
 - **证据不足**：保留可以确认的部分，对无法确认的 Claim 给出警告，**不允许根据常识补齐视频里没有的信息**。
 - **达到最大轮次**：保存带警告的最佳结果，同时保留 Critic 反馈供用户查看和修正。
 
-**代码细节：JSON 重试和「不伪装成功」分别在哪**
-
-- **JSON 非法**：`DeepSeekUtils.structuredChat`（`:380-388`）捕获解析失败后，
-  追加一句「请严格返回合法 JSON，不要添加解释或代码块。」**再问一次**，并计
-  `structuredOutputRetries`。所以是一次格式修复，不是无限循环。
-  两次都失败则由 `parseJson` 抛 `IllegalStateException("模型未返回 JSON 对象")`（`:375`）。
-- **模型调用本身的重试**是另一层：`chat()`（`:392`）最多 `MAX_MODEL_ATTEMPTS = 3` 次（`:35`），
-  退避 `Thread.sleep(1_000L << attempt)`（`:467`）即 1 秒、2 秒。
-  可重试判定在 `isRetriableModelFailure`（`:450-463`）：HTTP 状态为 408 / 429 / ≥500 可重试，
-  其余 4xx 视为永久错误，抛 `IllegalArgumentException("模型请求不可重试")`。
-- **不伪装成功**：`AgentLoopService.validateResult`（`:259-263`）在结果结构不完整时直接抛
-  `IllegalStateException("Executor 未生成完整结构化结果")`，不做兜底填充。
-- **达到轮次**：`critiqueRound`（`:219-231`）在 `round >= maxRounds` 且未通过时，
-  阶段标记为 `TaskStage.ANALYSIS_COMPLETED_WITH_WARNINGS`，
-  对应 `saveResult` 落库的 warning 语义（`AgentCheckpointService.java:127-128`）。
-
 调用异常进入 Checkpoint 与 MQ 恢复；预算耗尽属于主动终止，进入独立终态 `BUDGET_EXHAUSTED`，不再交给 MQ 重试，因为重试不会改变预算条件，只会继续消耗资源。
 
 ### Q18：为什么不能只设置「最多两轮」？
 
 轮次只能限制循环次数，不能覆盖单次模型调用过慢、上下文过大或模型价格变化。所以系统同时设置四个预算：**最大轮数、最大执行时长、预估 Token、预估费用**。每个关键模型阶段结束后读取当前消耗，任一条件超过上限就终止。
-
-**代码细节：四个预算的配置项和默认值**
-
-| 预算 | 配置项 | 默认值 | 在代码里的位置 |
-| :--- | :--- | :--- | :--- |
-| 最大轮数 | `agent.budget.max-rounds` | 2 | `AgentLoopService.java:43` |
-| 最大执行时长 | `agent.budget.max-duration-ms` | 120000（120 秒） | `:44` |
-| 预估 Token | `agent.budget.max-estimated-tokens` | 50000 | `:45` |
-| 预估费用 | `agent.budget.max-estimated-cost` | 0（关闭） | `:46` |
-
-检查点是 `checkBudget(startedNanos, completedStage)`（`:445-460`），只做
-`>` 比较，任一超限就抛 `BudgetExceededException`。费用预算为 0 时该分支被跳过
-（`:454`），所以默认配置下**费用预算实际不生效**。
-
-时长预算其实有**两层**，不要只讲一层：
-
-1. `AgentExecutionBudget`（`AgentExecutionBudget.java:10-45`）用 `ThreadLocal<Long>` 保存
-   deadline，`open(maxDurationMs)` 取「当前剩余」和「新请求」的较小值（`:21`），
-   支持嵌套收窄。`DeepSeekUtils` 每次模型调用用它算自己的超时：
-   `min(modelTimeoutMs, AgentExecutionBudget.remainingMillis())`（`DeepSeekUtils.java:420-421`）。
-   **这是唯一能在阻塞式 HTTP 调用内部生效的预算**。
-2. `AgentLoopService.checkBudget` 只在模型阶段之间做检查。
 
 当前默认最多两轮，是因为第一轮生成、第二轮定向修正已经能形成最小闭环。
 
@@ -524,64 +284,13 @@ Critic 必须返回结构化失败原因，程序按类型分流：
 
 `AUTO` 是**纯前端概念**：提交前先调路由接口，由 ModeRouter 让 AI 判定模式，再按具体模式提交。AUTO 本身永远不进入后端带 key 的接口，从根上避免读写端 key 不对称。路由不可用时回退 GENERAL，不阻断分析任务。
 
-**代码细节：四个模式的 requiredSectionKeys**
-
-`dto/AnalysisMode.java:13-22` 只有四个枚举值，顺序是 `GENERAL, LEARNING, REVIEW, CREATION`。
-每个模式在 `ModeRegistry`（`service/mode/ModeRegistry.java:24-65`）注册一份
-`ModeProfile(mode, displayName, planInstruction, executeInstruction, criticInstruction, requiredSectionKeys)`：
-
-| 模式 | displayName | requiredSectionKeys |
-| :--- | :--- | :--- |
-| `GENERAL` | 通用分析 | `[]`（空，只要求通用字段） |
-| `LEARNING` | 学习复习 | `["outline","keypoints","quiz","pitfalls"]` |
-| `REVIEW` | 内容审查 | `["fallacies","exaggerations","omissions","doubtful"]` |
-| `CREATION` | 内容创作 | `["highlights","titles","intro","script"]` |
-
-`requiredSectionKeys` 会被程序强校验：`isResultValid`（`AgentLoopService.java:265-280`）要求
-`result.sections()` 里确实存在这些 key 且 `items` 非空，
-缺失时由 `enforceStructureBounds`（`:340-365`）写进 Critic 的 feedback 触发重写。
-所以模式不只是换 Prompt，**结构约束是程序在兜**，模型漏段落会被判不通过。
-
-`ModeRegistry` 构造时做启动自检（`:60-64`）：任何 `AnalysisMode` 没注册 Profile 直接抛
-`IllegalStateException`，避免新增模式后静默回退。
-
-**路由的两套限流**（`service/mode/ModeRouter.java:34-35`）：
-`limit:ai:route:user:{userId}` 每分钟 10 次、`limit:ai:route:global` 每分钟 60 次，
-与分析任务的 5 / 30 是两组独立的配额。路由**从不抛异常**：配额耗尽、Redis 异常、
-目标为空、LLM 异常四种情况都返回 GENERAL 并附带可展示的 reason（`:70-76`），
-让路由故障永远不阻断分析。
+这是刻意的设计取舍：路由只是增强，故障时回退通用模式，永远不阻断分析任务。
 
 ### Q20：如何证明 AgentLoop 优于单次 Prompt？
 
 我会固定同一批 VideoContext 和用户目标，比较单次 Prompt、Planner + Executor、完整 P-E-C 三组。结果指标看结构完整率、目标覆盖、时间戳覆盖、证据支持和 Claim 证据支持；过程指标看模型调用次数、平均轮次、耗时、Token 和预算终止次数。
 
 仓库提供 4 个最小 Golden Case，覆盖多模态互补、纯语音、纯画面和音画冲突，评测入口会走真实 AgentLoop。它现在只是回归框架，还没有实际运行数据，所以面试中只能讲评测设计，不能声称已经达到某个通过率。后续应增加人工标准答案、困难负样本和跨模型回归，避免用同一模型既生成又自证。
-
-**代码细节：4 个 Golden Case 和评测指标**
-
-用例定义在 `src/main/resources/evaluation/golden-video-tasks.json`，四个用例的 `userGoal`
-和 `expectedKeywords` 均可直接引用：
-
-| # | name | userGoal | expectedKeywords |
-| :--- | :--- | :--- | :--- |
-| 1 | 课程视频-ASR与OCR互补 | 生成二叉树前序遍历学习笔记，给出步骤和证据 | 前序遍历 / 根节点 / 左子树 / 右子树 |
-| 2 | 会议视频-纯语音待办 | 整理会议结论、负责人和截止时间 | 七月二十五日 / 灰度发布 / 张明 |
-| 3 | 操作录屏-纯画面步骤 | 提取画面中的构建命令和输出目录 | npm run build / dist |
-| 4 | 音画冲突-保留不确定性 | 核验视频中的最终上线日期，存在冲突时明确指出 | 8月1日 / 8月3日 / 冲突 |
-
-指标由 `AgentEvaluationService.evaluate`（`:30-95`）在 `LinkedHashMap` 里产出：
-`structuredValid`、`timestampCoverageRate`、`evidenceSupportRate`、`claimEvidenceSupportRate`、
-`criticPassed`、`userAcceptanceRate`、`feedbackSamples`。
-
-**跑法**：`agent.evaluation.enabled=true` 时 `OfflineAgentEvaluationRunner` 作为
-`ApplicationRunner` 在启动时加载 JSON 并逐条 `agentLoopService.run(context)`（`:52-56`）。
-单条判定成功的条件是三项**同时**满足（`:59-61`）：`structuredValid == true`
-且 `claimEvidenceSupportRate >= 0.8` 且 `keywordCoverage >= 0.8`
-（`keywordCoverage` = `expectedKeywords` 在 `result.toMarkdown()` 里的小写子串命中率）。
-
-要主动说清两个边界：**默认关闭**（`agent.evaluation.enabled` 默认 `false`，`application.properties`），
-所以仓库里那 4 个用例从未在 CI 里跑过；**没有人工标准答案**，判定完全靠关键词包含率和
-自证的证据支持率，这也是 Q20 说「不能编通过率」的原因。
 
 ---
 
@@ -650,40 +359,6 @@ Critic 必须返回结构化失败原因，程序按类型分流：
 6. 生成 ASR-only / OCR-only / 双模态 三种 Segment
 ```
 
-**代码细节：两路分支的提交和汇合**
-
-入口是 `VideoContextService.build(videoPath, userGoal, traceId)`（`:70`），两路各提交一个
-`Future`：
-
-```java
-Future<BranchResult<TranscriptSegment>> = submitBranch(asrExecutor, ...)   // :79
-Future<BranchResult<FramePart>>        = submitBranch(ocrExecutor, ...)   // :84
-```
-
-关键设计是**分支不向外抛异常，而是返回 `BranchResult<T>(List<T> items, Exception error)`**
-（`:360-372`）。`submitBranch` 里用 `try/catch` 把异常收进结果（`:171-179`），
-所以 `finishContext`（`:145-160`）能同时看到「一边成功一边失败」并继续：
-两路都失败才抛 `IllegalStateException("ASR 和 OCR 分支均失败")`，
-任一路失败计 `asrBranchFailures` / `ocrBranchFailures` 并继续，最后
-`segments.isEmpty()` 才判定整体失败（`:162`）。
-
-截止时间是两路**共享**的同一个 deadline：`System.nanoTime() + 60 分钟`（`:90`），
-`awaitBranch` 用 `future.get(remainingNanos, NANOSECONDS)` 逐路等待（`:186-191`）。
-超时后 `cancelBranches` 会 `cancel(true)` 中断两路，并**最多等 10 秒**
-（`branchesFinished.await(10, SECONDS)`，`:198`）让分支自己退出；
-10 秒内没退干净就保留工作目录不删（`cleanupWorkDir=false`，`:113`），避免删掉仍在写的文件。
-这是 60 分钟预算之外的第二个隐性边界。
-
-`VideoContext.VideoSegment` 的字段是：
-
-```java
-record VideoSegment(long startMs, long endMs, String transcript,
-                    List<String> ocrTexts, List<String> evidenceFrames)
-```
-
-`evidenceFrames` 存的是 MinIO 上的关键帧地址；帧上传失败时退化为
-`videoPath + "#timestampMs=" + timestampMs`（`:255`）。
-
 语音分支中，音频文件序号直接映射为起止时间，例如第二段对应 60 到 120 秒。视觉分支中，关键帧上传 MinIO 失败时会退化为原视频时间戳引用。两路都失败，或者最终没有任何有效 Segment，VideoContext 才整体失败。工作完成后删除本地音频、图片和 FFmpeg 日志等临时文件。
 
 ### Q24：场景变化检测、保底抽帧和感知哈希分别解决什么？
@@ -695,30 +370,6 @@ record VideoSegment(long startMs, long endMs, String transcript,
 1. **场景变化检测（> 0.35）**：抓 PPT 翻页、窗口切换和页面跳转，减少固定频率抽帧产生的大量重复图片。
 2. **30 秒保底**：兜住缓慢板书和长时间静态页面——它们可能一直达不到变化阈值。
 3. **dHash 感知哈希去重**：把图片缩放成 9×8 灰度图，逐行比较相邻像素亮度生成 64 位差异哈希，再与上一张图片异或统计不同位数；汉明距离不超过 5 时认为高度相似，跳过 OCR。这样一页静态 PPT 即使被保底多次抽到，也不会反复识别。
-
-**代码细节：抽帧的完整命令行和阈值**
-
-一条 FFmpeg 命令同时实现三层机制（`VideoContextService.java:211-216`）：
-
-```
-ffmpeg -y -i <video> \
-  -vf "select=eq(n\,0)+gt(scene\,0.35)+gte(t-prev_selected_t\,30),showinfo" \
-  -vsync vfr frame_%06d.jpg
-```
-
-三个条件是**加号相或**：`eq(n,0)` 第一帧、`gt(scene,0.35)` 场景变化、
-`gte(t-prev_selected_t,30)` 距上次选中 30 秒。这三个常量在代码里分别是
-硬编码的 `0.35` 和 `30`（`:213`），只有 `FALLBACK_FRAME_INTERVAL_MS = 30_000L`
-（`:42`）和 `SEGMENT_MS = 60_000L`（`:41`）是命名常量——**0.35 是字符串里写死的，改它要改命令行**。
-
-dHash 的实现（`differenceHash`，`:286-305`）：缩放到 **9×8** 灰度图，
-逐行比较相邻像素（`getRGB(x,y) > getRGB(x+1,y)`）生成 **64 位**哈希；
-`Long.bitCount(previousHash ^ imageHash) <= 5` 判为重复并跳过 OCR（`:228`）。
-注意哈希是**只和上一张保留的帧比**，不是和全部历史帧比。
-
-`showinfo` 打出的 `pts_time` 由正则 `pts_time:([0-9.]+)` 解析（`:43`、`:334-340`），
-乘 1000 转毫秒。这里有个**兜底**要讲：如果日志里解析到的帧数少于实际抽出的帧数
-（`i >= timestamps.size()`），时间戳退化为 `i * 30_000`（`:232`）——由序号推算，不再精确。
 
 `showinfo` 同时在日志里记录每帧的 `pts_time`，Java 解析并换算成毫秒，所以 OCR 文本最终能回到原视频时间轴。
 
@@ -787,23 +438,6 @@ dHash 的实现（`differenceHash`，`:286-305`）：缩放到 **9×8** 灰度�
 
 融合时用时间戳整除 60 秒得到窗口起点，窗口采用左闭右开，例如恰好位于 120 秒的帧只进入 120 到 180 秒，不会同时属于前后两个片段。先建立统一窗口再填充两路数据，可以自然保留没有语音但有画面文字的 OCR-only Segment，以及只有语音的 ASR-only Segment。
 
-**代码细节：分片命令和 ASR 重试**
-
-切片命令在 `SegmentedTranscriptionService.java:83-90`：
-
-```
-ffmpeg -y -i <video> -vn -acodec libmp3lame \
-  -f segment -segment_time 60 -reset_timestamps 1 audio_%03d.mp3
-```
-
-`-reset_timestamps 1` 让每片时间戳从 0 重新开始，所以分片序号可以直接映射时间：
-第 `i` 片对应 `[i*60000, (i+1)*60000]`（`:50`），**不依赖 ASR 返回任何时间信息**。
-
-ASR 的重试在 `AliyunAsrUtils`（`:24`、`:52-63`）：`MAX_ATTEMPTS = 3`，
-退避 `Thread.sleep(1_000L << attempt)` = 1 秒、2 秒。可重试判定很窄：
-只有 `IOException` 会被重试，其中 HTTP **429 和 ≥500** 被包装成
-`RetryableAsrException extends IOException`（`:85-86`），
-**其他 4xx 抛 `IllegalArgumentException`，不重试**（`:90`）；空文本
 抛 `IllegalStateException("ASR 返回空文本")`，也不重试。
 对比之下 LLM 侧是「408/429/≥500 可重试」，两边口径一致但实现独立。
 
@@ -819,36 +453,12 @@ RocketMQ 负责整个视频分析任务离开 Web 请求线程，ASR 和 OCR 是
 
 当前也没有使用公共 ForkJoinPool：ASR 使用独立有界线程池控制网络调用，OCR 根据机器 CPU 数量配置有界线程池，队列满时直接拒绝，避免无上限堆积。
 
-**代码细节：这里有两层「并行」，粒度不同，别混为一谈**
-
-1. **视频级**：`VideoContextService` 把「整条 ASR 分支」和「整条 OCR 分支」分别提交到
-   `asrExecutor` 和 `ocrExecutor`（`:79-88`）。**这一层是并行的**，所以总耗时接近较慢的那一路。
-2. **分片级**：`SegmentedTranscriptionService.transcribe` 内部是**串行 for 循环**
-   （`:44-58`），一个 60 秒切片调完 ASR 才调下一个。
-
-所以准确说法是「**语音分支和视觉分支并行，但语音分支内部的分片是串行的**」。
-Q91 里「长视频的 ASR 按 60 秒切片并发提交」这句话与代码不符，应改为：
-长视频被切成多个 60 秒分片**逐个**调用 ASR，切片的作用是把失败范围缩小到单片
-（单片失败只计 `asrSegmentFailures` 并继续，`:52-57`），不是提高吞吐。
-
 这确实是一个明确的改进点：把分片提交到线程池可以让长视频的 ASR 显著加速，
 但受第三方限流和 `asrExecutor` 的 4 个核心线程约束，需要配合并发度控制一起做。
 
 ### Q28：ASR 或 OCR 局部失败、识别错误或内容冲突时怎么办？
 
 两条 Future 不直接向外抛出单路异常，而是返回分支结果。ASR 按 60 秒片段隔离失败，OCR 按关键帧隔离失败；单个片段失败不会删除其他成功结果。
-
-**代码细节：隔离的具体判据和清理顺序**
-
-- ASR 分片：`catch (RuntimeException e)` 只累加 `failedSegments` 和 `lastSegmentError` 后继续
-  （`SegmentedTranscriptionService.java:52-57`）。
-- OCR 关键帧：`catch (RuntimeException e)` 计 `ocrFrameFailures` 后 `continue`（`:237-243`）。
-  接着**还有一道判据**：`result.isEmpty() && failedFrames > 0` 时抛
-  「所有 OCR 关键帧均处理失败」（`:259-261`）——全失败和部分失败区别对待。
-- 失败分支的**资源清理**要单独讲：OCR 分支失败时，
-  `finishContext` 会调 `deleteEvidenceFrames(uploadedEvidenceFrames)` 把**已经上传到 MinIO
-  的关键帧删掉**（`:155-160`）。理由是整条 OCR 分支没有产出，留着这些帧既是孤儿对象也浪费空间。
-  这是「先上传、失败后补偿删除」，不是事务性回滚。如果一整条分支失败，系统记录分支缺失并保留另一条证据；只有两路都失败或最终没有任何有效 Segment 才让 VideoContext 构建失败。
 
 后续 Agent 只能使用实际存在的证据。**只有 OCR 时可以描述画面文字，不能推测讲解；只有 ASR 时可以总结语音，不能声称读取了 PPT。** 某个目标依赖缺失模态时，应返回部分结果或证据不足，而不是静默降级后生成完整答案。
 
@@ -890,34 +500,6 @@ ASR + OCR 的链路更长，但结果可以持久化和复用，证据能定位�
 5. 短于 5 分钟的视频直接用原始 Segment，不额外生成摘要和向量
 ```
 
-**代码细节：Chunk 的切法和「短于 5 分钟」的判据**
-
-切块在 `VideoChunkingService.build`（`:32-64`）：从 `start = 0` 开始以 5 分钟步长推进，
-取 `segment.startMs() >= chunkStart && segment.startMs() < chunkEnd` 的片段。
-`CHUNK_MS = 5 * 60 * 1000L`（`:18`）——**按时间轴切，不是按片段数切**，
-所以块与块之间不会重叠，但可能有的块为空（空块被 `continue` 跳过，`:50`）。
-
-Chunk 的字段和入库内容：
-
-```java
-record VideoChunk(long startTime, long endTime, String segmentSummary,
-                  List<String> keywords, List<VideoContext.VideoSegment> rawSegments,
-                  List<Double> embedding)
-```
-
-注意 `rawSegments` **也被存进 Checkpoint**——检索命中后展开原文靠的就是它，
-不需要二次查询原始视频。
-
-「短于 5 分钟」的判据在 `LongVideoContextService.selectRelevant`（`:41-44`）：
-用**最后一个片段的 `endMs() <= CHUNK_MS`** 判断，为真则直接返回全部原始片段，
-连 `VideoChunkingService` 都不调用，所以确实不产生摘要和向量。
-
-字符预算 `MAX_CONTEXT_CHARS = 24_000`（`:19`）在 `withinBudget`（`:90-105`）里生效：
-按候选顺序累加 `transcript.length() + ocrTexts` 总长，超预算的片段**跳过但继续尝试后面的**
-（`if (!selected.isEmpty() && ...) continue;`）——第一个片段无论多长都保留，
-避免预算过小时返回空上下文。丢弃数量记 `contextSegmentsDropped`，实际用量记 `contextChars`。
-最后按 `startMs` 重新排序（`:103`），因为检索给出的是相关度顺序，模型需要的是时间顺序。
-
 五分钟是当前课程视频场景的工程折中：一分钟块数量太多，知识点容易跨块；十五分钟块命中后又会带入大量无关内容。它不是行业标准，视频类型变化后应该重新评估。
 
 ### Q33：为什么同时需要关键词和 Embedding？各自权重是多少？
@@ -930,43 +512,6 @@ Embedding 能处理「递归效率」和「递归时间复杂度」这类语义�
 Chunk 级：  语义（向量）0.6  + 语音关键词 0.25  + 视觉关键词（OCR）0.15
 Segment 级：chunk 得分 0.55 + 语音关键词 0.25  + 视觉关键词 0.20
 ```
-
-**代码细节：三路打分的实现和查询意图**
-
-权重在 `VideoEvidenceRetrievalService` 里是**字面量**，不在配置里：
-
-```java
-// Chunk 级 —— score()，:100-102
-semanticScore * 0.6 + termScore(intent.keywords(), searchableText(chunk)) * 0.25
-                    + termScore(intent.visualKeywords(), visualText(chunk)) * 0.15
-
-// Segment 级 —— scoreSegment()，:123-127
-chunkScore * 0.55 + transcriptScore * 0.25 + visualScore * 0.20
-```
-
-检索前先用一次 LLM 调用把用户目标拆成三路查询（`planRetrieval`，`DeepSeekUtils.java:180`），
-返回的字段名就是 `VideoRetrievalIntent` 的三个字段：
-
-```java
-record VideoRetrievalIntent(String semanticQuery, List<String> keywords, List<String> visualKeywords)
-```
-
-- `semanticQuery` 只用于生成 embedding（`:60`），不参与关键词匹配；
-- `keywords` 去查语音文本（`searchableText`，含摘要 + 关键词 + 全部 transcript，`:151-158`）；
-- `visualKeywords` **只查 OCR 文本**（`visualText`，`:160-164`）——这是「画面里写了什么」的独立通道。
-
-`termScore`（`:175-184`）就是**命中词数 / 总词数**的比值，匹配方式是
-`normalizedContent.contains(normalizedTerm)`，只做包含判断。
-
-`VideoRetrievalIntent` 构造时会把词表归一化并**截断到 16 个**（`dto/VideoRetrievalIntent.java:18-27`），
-所以单次检索最多 16+16 个关键词。
-
-LLM 拆查询失败时有确定性兜底（`:200-208`）：用中英文标点切分原目标，
-取长度 ≥2 的词，**去重后取前 8 个**（`fallbackTerms`，`:223-232`），
-且语音和视觉两路用**同一份兜底词表**。计 `retrievalIntentFallbacks`。
-
-排序规则里还有一个细节：Segment 按分数降序后，**用起始时间做第二排序键**
-（`.thenComparingLong(startMs)`，`:77-78`），保证同分片段按时间先后稳定输出。
 
 视觉关键词是独立通道，回答的是「画面里写了什么」。要主动指出：作者早期文档写过「语义 0.7 / 关键词 0.3」，那已经过时，当前实现是 0.6 / 0.25 / 0.15。
 
@@ -1005,26 +550,7 @@ Critic 发现遗漏任务或无证据 Claim 后，会把 feedback、missingRequi
 
 当前固定 Top3 和字符预算是可控起点，**没有实现低分自动扩大 TopK，也没有命中后自动加载相邻 Chunk**。面试中应把这两项说成明确改进方向（当最高分过低或 Claim 无法取证时扩大候选范围），而不是把它包装成已经完整解决。
 
-**代码细节：两个 TopK 是分开的常量**
-
-| 常量 | 值 | 用途 | 位置 |
-| :--- | :--- | :--- | :--- |
-| `TOP_K` | 3 | 目标级检索返回的 Chunk 数 | `VideoEvidenceRetrievalService.java:20` |
-| `TOP_K * 2` | 6 | 向 Qdrant 请求的候选数 | `:109` |
-| `MAX_USER_HITS` | 8 | 用户主动查证据时返回的片段数 | `:21` |
-| `MAX_SNIPPET_LENGTH` | 180 | 证据片段摘要的截断长度 | `:22` |
-
-**向 Qdrant 取 6 条、只用 3 条**是有意的余量：因为最终排序是
-「语义 + 语音关键词 + 视觉关键词」三路融合，纯向量 Top3 未必是融合后的 Top3，
-多取一倍给关键词通道留出翻盘空间。这个细节能体现「混合检索不是把两路结果拼起来」。
-
-**还有一层降级不体现在常量上**：`vectorScores`（`:105-115`）失败时返回空 Map，
-`score` 里对 `remoteScore == null` 的 Chunk 回落到
-`cosine(queryEmbedding, chunk.embedding())`（`:96-99`）——
-即**用 Checkpoint 里存的本地向量算余弦相似度**，而不是直接丢掉语义分。
-所以 Qdrant 挂掉后仍保留完整的三路打分，只是候选集从「Qdrant 近邻」变成「全部 Chunk」，
-性能下降但召回逻辑不变。只有 embedding 也为空时（`embed()` 返回 `List.of()`，`:210-217`）
-语义分才真的退化为 0。
+这会导致语义检索彻底失效，退化为纯关键词排序。
 
 ### Q38：Checkpoint 与 MQ 重试、幂等和缓存有什么区别？
 
@@ -1046,74 +572,8 @@ Critic 发现遗漏任务或无证据 Claim 后，会把 feedback、missingRequi
 
 同一视频生成复习笔记和操作步骤时，可以共享 ASR / OCR 和索引，不能共享 Plan 和结果。这个划分同时服务于继续追问、内容级去重和目标级幂等，避免旧目标状态污染新任务。
 
-**代码细节：目标摘要到底怎么算**
-
-`goalDigest` 就在 `utils/AnalysisTaskKeys.java`，是两个重载（`:26-49`）：
-
-```java
-goalDigest(goal)          → sha256(goal.trim())
-goalDigest(goal, mode)    → GENERAL 时直接委托上面那个（逐字节不变）
-                            其余模式 sha256(mode.name() + '␟' + goal.trim())
-```
-
-三个细节值得说：
-
-1. **是 SHA-256 十六进制，不是 MD5**，长度 64。`analysis:*` 系列 Key 都带上它。
-2. 分隔符是 `U+241F`（`␟`，UNIT SEPARATOR）这个不可见字符，注释里写明是为了避免
-   「模式名 + 目标」与某个真实目标文本发生摘要碰撞（`:47`）。
-3. **GENERAL 走的是不含模式的那条路径**，所以引入模式体系前后，GENERAL 目标的
-   所有 Key 和缓存**逐字节不变**，历史数据不会失效。这是个刻意的兼容设计。
-
-`contentHash` 侧也有归一化（`normalizeContentHash`，`:19-24`）：用正则 `[a-fA-F0-9]{32}`
 校验，**合法才用真实 MD5 并转小写，否则退化为字符串 `"media-" + mediaId`**。
 所以上传完成前的视频、或者 MD5 缺失的记录，仍然有稳定的幂等键可用，不会因为拿不到 MD5 而失效。
-
-**代码细节：Checkpoint 键和数据库行的完整格式**
-
-Redis Key 由 `AgentCheckpointService` 构造（`:291-321`）：
-
-| 层级 | Redis Key / 字段 | 说明 |
-| :--- | :--- | :--- |
-| 媒体级 Key | `agent:checkpoint:{mediaId}` | Hash，字段 `stage` 等 |
-| 目标级 Key | `agent:checkpoint:{mediaId}:goal:{goalDigest}` | 每个目标一个独立 Hash |
-| 目标索引 | `agent:checkpoint:{mediaId}:goals` | Set，存所有目标级 Key，便于按视频清理 |
-| 反馈 | `agent:feedback:{mediaId}` | List，TTL 30 天 |
-| 修订暂存 | `...:goal:{goalDigest}:revision` | 修订中间态 |
-
-MySQL 表 `agent_checkpoints` 的列是
-`media_id` / `checkpoint_key` / `stage` / `payload` / `updated_at`，
-**主键是 `(media_id, checkpoint_key)`**，`payload` 为 `LONGTEXT`。
-`checkpoint_key` 的取值有两类：
-
-```
-media:context              media:chunks              media:stage
-goal:{goalDigest}:plan     goal:{goalDigest}:result
-goal:{goalDigest}:criticState                        goal:{goalDigest}:stage
-revision:{goalDigest}
-```
-
-清楚看到「要点 Q39 说的两类划分在这个列值里就是 `media:` 和 `goal:` 前缀」。
-
-**代码细节：状态和产物怎么保证一起写**
-
-这是 Q42「假完成」问题的具体答案。`AgentCheckpointRepository.write(...)`（`:70-87`）在
-**同一个 `@Transactional`** 里发两条 upsert：
-
-```java
-upsert(mediaId, checkpointName,      stage.name(), payload);  // 产物行
-upsert(mediaId, stageCheckpointName, stage.name(), null);     // 状态行（payload 为空）
-```
-
-所以不存在「写了 `PLAN_COMPLETED` 却没有 Plan」——两条在同一事务里，要么都在要么都不在。
-Redis 缓存则挂在 `afterCommit` 回调上（`:83`、`:189-200`），**只有事务提交成功才更新缓存**，
-避免 MySQL 回滚而 Redis 留下了脏值。
-
-upsert 用的是 MySQL 原生
-`INSERT ... ON DUPLICATE KEY UPDATE stage = VALUES(stage), payload = VALUES(payload), updated_at = CURRENT_TIMESTAMP(3)`
-（`mapper/AgentCheckpointMapper.java:20-28`），靠 `(media_id, checkpoint_key)` 主键收敛。
-**这不是 MyBatis-Plus 的 `saveOrUpdate`**，是手写注解 SQL。
-
-修订场景用的是 `writeStandalone(...)`（`:89-103`），只写一行、不写配对的状态行。
 
 需要注意：目标级键实际是 `goalDigest(goal, mode)`，**包含模式维度**，所以同一目标在不同分析模式下互不覆盖。
 
@@ -1136,15 +596,6 @@ upsert 用的是 MySQL 原生
 | Critic 未通过 | 带着反馈和时间戳补证 |
 | Result | 只补最终落库和展示 |
 
-**代码细节：恢复判据分别在哪一行**
-
-- **跳过 ASR / OCR**：`AiService.resolveContext`（`:148-152`）先读
-  `checkpointService.loadContext(mediaId)`。
-- **跳过摘要和 Embedding**：`LongVideoContextService.resolveChunks`（`:113-127`）先读
-  `loadChunks(mediaId)`，命中计 `chunkCheckpointHits`。
-- **从 Executor 开始**：`AgentLoopService.resolvePlan`（`:158-161`）读到 Plan 就直接跳过 Planner。
-- **从 Critic 继续**：判据是 `state.result() != null && state.critique() == null && state.round() > 0`
-  （`:127`），命中计 `criticCheckpointResumes`。
 - **带反馈补证**：`contextForRetry` → `refineForCritique`，计 `criticEvidenceRefreshes`。
 
 边界：ASR 单个切片和 OCR 单帧失败目前主要在一次构建内部隔离，没有持久化到每个切片和帧的 Checkpoint。当前优先保存重算成本最高、边界最清晰的阶段，等超长视频失败率和成本确实上升后再细化。
@@ -1159,51 +610,9 @@ Checkpoint 写入把产物和阶段同时持久化，读取终态时还会校验
 
 检索需要和全量输入做对照，观察相关时间段 Recall@K、最终 Claim 证据支持、输入 Token、上下文长度和总延迟。Checkpoint 通过故障注入验证，在 VideoContext、Chunk、Plan、Executor 和 Critic 后主动失败，检查恢复起点、重复模型调用、最终结果和数据库重复记录。
 
-**代码细节：现有单测覆盖了哪三件事**
-
-`server/src/test/java/com/example/server/service/` 下只有 3 个测试类、4 个测试方法，
-都是纯 Mockito 单测，不依赖真实 Redis / MySQL：
-
-| 测试类 | 测什么 | 值得说的点 |
-| :--- | :--- | :--- |
-| `EvidenceVerificationServiceTest` | 证据校验的正反例 | 正例：125000ms 处原文「根节点、左子树、右子树」判定支持；反例：**相似但不相同的文本必须判不通过**。这个反例正好守住 Q15 说的「不能只看像不像」 |
-| `AgentExecutionBudgetTest` | 时长预算到期后必须抛 `DeadlineExceededException`，`Scope` 关闭后恢复 | 验证 ThreadLocal 死线没有泄漏到后续调用 |
-| `AgentCheckpointServiceTest` | 修订状态机：先 `stageRevision` 暂存 → `beginStagedRevision` 清旧产物并写新 Plan | 断言了 `deleteByPrefix` 被调用、阶段从 `REVISION_PENDING` 变 `REVISION_APPLIED` |
-
-边界要主动说：**这 4 个测试覆盖的是三个最容易被写错的纯逻辑点**（证据包含方向、
-ThreadLocal 死线、修订的清理顺序），不是完整回归。
-AgentLoop 的多轮编排、MQ 消费的失败分流、上传合并的幂等都没有自动化测试，
-所以 Q51/Q60/Q69 里那些「怎么验证」的答案目前都还是方案而不是已执行的结果。
-
 当前 Trace 已记录检索最高分、召回 Chunk 数、上下文长度、Checkpoint 命中、模型调用和阶段耗时，为验证提供了数据入口。仓库没有实际压测和回归结果，因此只能讲验证方案与已埋指标，不能写「降低多少 Token」或「恢复成功率多少」。
 
-**代码细节：已埋指标的确切名字**
-
-被追问「你说埋了指标，具体叫什么」时可以直接报。`AgentTelemetry` 自动记录的：
-`modelCalls`、`inputTokensEstimated`、`outputTokensEstimated`、`estimatedCost`、
-每个阶段一个 `{stage}Calls`、`failedStages`；`stageDurationMs` 是阶段耗时 Map。
-
-各调用方 `incrementCurrent` 的自定义计数器（按关注点分组）：
-
-| 关注点 | 计数器 |
-| :--- | :--- |
-| 检索 | `retrievalChunks`、`retrievalTopScore`（gauge）、`retrievalIntentFallbacks`、`vectorStoreWrites`、`vectorStoreFallbacks`、`embeddingFallbacks`、`summaryFallbacks` |
-| 上下文 | `contextChars`（gauge）、`contextSegmentsDropped`、`chunkCheckpointHits`、`contextCheckpointHits`、`contextContentReuses`、`contextLockContentions` |
-| Agent | `criticRounds`、`criticPassed`、`criticEvidenceRefreshes`、`criticRewriteOnlyRetries`、`planRevisions`、`planRevisionFallbacks`、`planStructureRepairs` |
-| Checkpoint | `checkpointHits`、`terminalCheckpointHits`、`criticCheckpointResumes`、`invalidTerminalCheckpointRepairs` |
-| 预算 / 输出 | `budgetTerminations`、`structuredOutputRetries`、`modelCallFailures` |
-| 模态分支 | `asrCalls`、`asrSegmentFailures`、`asrBranchFailures`、`ocrCalls`、`ocrFrameFailures`、`ocrBranchFailures`、`frameUploadFailures` |
-
-**Token 估算口径**（`AgentTelemetry.java:227-232`）：非 ASCII 字符**每个算 1 token**，
-ASCII 字符按 `(n + 3) / 4`。这是「字符规则估算」的具体规则——
-中文按 1:1 计，英文按 4 字符 1 token 计。已知这会偏离真实 tokenizer，
-所以 `max-estimated-tokens = 50000` 是一个**保守**的阈值。
-
-Trace 的存储（`:211-221`）：`agent:trace:{traceId}`、
-`agent:trace:task:{taskId}:{goalDigest}`、索引 `agent:trace:task:{taskId}:goals`，
-`TRACE_TTL = 7 天`、`MAX_TRACES = 500`。**`MAX_TRACES = 500` 是一个硬上限**，
-意味着 Trace 会被裁剪——拿它做长期回归数据是不够的，这也是 Q94 里
-「评测集没有形成长期闭环」的一部分原因。
+这也是评测集始终没有形成长期闭环的原因之一。
 
 ---
 
@@ -1223,21 +632,6 @@ Trace 的存储（`:211-221`）：`agent:trace:{traceId}`、
      → 上传完整文件 → 存 media_files → 写 completedKey → 清理分片与 Redis 元数据
 ```
 
-**代码细节：三组 Key 和对象路径**
-
-全部在 `ChunkUploadService` 里，常量 `UPLOAD_KEY_PREFIX = "upload:chunked:"`（`:38`）：
-
-| 用途 | 格式 | TTL |
-| :--- | :--- | :--- |
-| 元数据 Hash | `upload:chunked:{uploadId}`（字段 `filename` / `totalChunks` / `userId`） | 1 天 |
-| 已完成分片 Set | `upload:chunked:{uploadId}:parts`（成员是分片序号的字符串） | 1 天 |
-| 合并完成标记 | `upload:chunked:{uploadId}:completed`（值是 `mediaId`） | 1 天 |
-| 合并锁 | `lock:upload:merge:{uploadId}`（Redisson） | WatchDog 续期 |
-| 分片对象 | `chunk-uploads/{uploadId}/part-{chunkIndex}` | 合并后逐片删除 |
-
-两个常量：`MAX_CHUNK_BYTES = 5L * 1024 * 1024`（`:39`）、`MAX_TOTAL_CHUNKS = 410`（`:40`）。
-
-合并的流式实现值得指出具体写法（`:135-144`）：用 `Files.createTempFile` 建临时文件，
 外面套 `BufferedOutputStream` 再套 `DigestOutputStream`，循环
 `minioUtils.copyObjectTo(chunkObjectName(uploadId, i), output)` 按 0..N-1 顺序拉取。
 MD5 是在**写入过程中**由 `DigestOutputStream` 累积的，不是写完再扫一遍文件。
@@ -1251,20 +645,6 @@ MD5 是在**写入过程中**由 `DigestOutputStream` 累积的，不是写完�
 
 因此当前能力是「**合并后内容级解析去重**」，不是上传前跨用户秒传。代码也没有前端分片 MD5 与服务端重算的对比，不能讲双端完整性校验。现有完整性主要依赖分片数量、顺序读取和对象存储写入成功。
 
-**代码细节：contentHash 从哪来、存在哪**
-
-`contentHash` 由合并时算出的 MD5 传入 `mediaService.saveUploadedMedia(...)`
-（`ChunkUploadService.java:147-148`）并写入 `media_files.content_hash` 列，
-该列有普通索引 `idx_media_content_hash`（**不是唯一索引**）。
-
-读取时的缓存路径在 `MediaService.contentHash(mediaId)`（`:131-143`）：
-先查 Redis `media:md5:{mediaId}`，未命中再查 `media_files.content_hash` 并回填。
-**这个缓存写入没有设置 TTL**（`rememberContentHash`，`:81` 只调 `set` 不带 expire），
-理由是 MD5 对一条媒体记录永不变化。Redis 异常在这里被吞掉并记 warning（`:135-137`），
-因为读 MD5 失败最多导致退化成 `media-{id}` 形式的键，不该让分析失败。
-
-MD5 计算本身用的是 `MessageDigest.getInstance("MD5")` + 8192 字节缓冲，
-`HexFormat.of().formatHex(...)` 输出**小写**十六进制（`calculateMd5`，`:223-231`），
 正好匹配 `AnalysisTaskKeys` 里那条 `[a-fA-F0-9]{32}` 的校验正则。
 
 ### Q46：为什么坚持「先写 MinIO，再记录 Redis」？
@@ -1347,53 +727,8 @@ RocketMQ 在这里负责持久化任务入口和重新调度。Web 层只完成�
   8. 成功 → 写 completedKey（7 天）→ 发布 COMPLETED
 ```
 
-**代码细节：消息体和常量**
-
-`dto/AnalysisTaskMsg.java` 的字段只有五个（`:7-30`）：
-
-```java
-Long mediaId; String action; String contentHash; String userGoal; String mode;
-```
-
-两个 action 常量：`START_ANALYSIS = "START_ANALYSIS"`、`REVISE_ANALYSIS = "REVISE_ANALYSIS"`。
-`isRevision()` 就是判断 action 是否等于后者（`:43`）。mode 是**字符串**不是枚举，
-消费端用 `AnalysisMode.fromNullable(msg.getMode())` 宽松解析（`:92`），
-所以老消息（没有 mode 字段）会安全降级为 GENERAL。
-
-消费端的常量（`VideoAnalysisConsumer.java`）：
-
-| 常量 | 值 | 位置 |
-| :--- | :--- | :--- |
-| `MAX_DELIVERY_ATTEMPTS` | 3 | `:46` |
-| `ACTIVE_TTL` | 6 小时 | `:47` |
-| `MAX_CAUSE_DEPTH` | 16 | `:49` |
-| completedKey TTL | 7 天 | `:150-151` |
-| 注解 `maxReconsumeTimes` | 2 | `:41` |
-
-`MAX_DELIVERY_ATTEMPTS = 3` 是「投递次数」，注解上的 `maxReconsumeTimes = 2` 是
-「重投次数」，两者差 1 是吻合的。代码注释里专门写了这一点（`:33-35`），
 并说明**不设这个注解会退化成 MQ 默认的 16 次重投空转**——因为应用侧计数依赖 Redis，
 一旦异常发生在递增之前，应用侧上限就失效了。
-
-**代码细节：Topic 名称和配置项**
-
-| 配置项 | 默认值 |
-| :--- | :--- |
-| `rocketmq.topic.video-analysis` | `video-analysis-topic` |
-| `rocketmq.topic.video-analysis-dead` | `video-analysis-dead-topic`（项目自建失败主题） |
-| `rocketmq.consumer.group` | `video-analysis-consumer` |
-| `rocketmq.producer.group` | `video-analysis-producer` |
-
-有个**不一致**值得知道：`application.properties` 里 `rocketmq.consumer.group` 的默认值是
-`video-analysis-consumer`，而 `VideoAnalysisConsumer` 注解上 `${rocketmq.consumer.group:...}`
-的兜底值是 `video-analysis-group`（`:32`）。正常启动时 properties 会覆盖注解兜底，
-所以实际生效的是 `video-analysis-consumer`；但如果配置文件缺失该属性，两边就会不一致。
-这是配置冗余带来的隐患，不是设计意图。
-
-消费并发刻意没有配置（`consumeThreadNumber` / `consumeThreadMax`），
-代码注释里说明原因是**这两个属性名在 rocketmq-spring 各版本间变过**，
-配错会和容器默认值冲突导致启动期抛
-`consumeThreadMin is larger than consumeThreadMax`（`:37-40`）。
 
 ### Q54：任务长时间没响应，或者用户手动点了重新执行，分别怎么处理？
 
@@ -1412,36 +747,6 @@ Long mediaId; String action; String contentHash; String userGoal; String mode;
 
 所以「重跑」不是从头再来：视频级 Checkpoint（VideoContext、Chunk、向量）依然复用，只有目标级的 Plan、草稿和结果会被重算。
 
-**代码细节：暂存修订的状态机**
-
-修订中间态存在 `agent_checkpoints` 表的一个独立行，`checkpoint_key` 是
-`revision:{goalDigest}`，payload 是一个私有 record
-`RevisionCheckpoint(AgentPlan plan, boolean applied)`（`AgentCheckpointService.java:323`）。
-三个阶段对应三个方法：
-
-| 方法 | 动作 | 阶段 |
-| :--- | :--- | :--- |
-| `stageRevision` | 写 `revision:{digest}`，`applied=false`（投递前） | `REVISION_PENDING` |
-| `beginStagedRevision` | 若 `applied=true` 直接返回；否则删掉该目标全部旧 Checkpoint，写入新 Plan，改 `applied=true`（消费端接手时） | `REVISION_APPLIED` |
-| `completeStagedRevision` / `cancelStagedRevision` | 删除 `revision:{digest}` 行 | — |
-
-`beginStagedRevision` 上的清理动作值得单独讲（`:202-203`）：
-
-```java
-checkpointRepository.deleteByPrefix(mediaId, goalCheckpoint(goal, mode, ""));  // SQL LIKE 'goal:{digest}:%'
-redisTemplate.delete(goalKey(mediaId, goal, mode));                            // 删 Redis Hash
-```
-
-`deleteByPrefix` 的实现在 `mapper/AgentCheckpointMapper.java:30-31`，
-是 `checkpoint_key LIKE CONCAT(#{prefix}, '%')`，前缀正好是 `goal:{digest}:`，
-所以**只清掉这个目标的 plan / result / criticState / stage 四类产物，不碰 media 级数据**
-（`media:context`、`media:chunks` 前缀不同）。这就是「重跑不掉视频级缓存」的实现细节。
-
-方法上有 `@Transactional`（`:194`），保证「清理旧产物 → 写新 Plan → 标记 applied」
-三步原子。如果 MQ 投递失败，`cancelStagedRevision` 会删掉 revision 行，
-且因为 `beginStagedRevision` 还没被消费端调用过，旧结果其实是**原封不动**的
-（投递方的注释明确写了「MQ 投递失败时用户还有结果可看」，`AnalysisDispatchService.java:81`）。
-
 ### Q55：为什么幂等 Key 不能只有视频 MD5？activeKey、锁、completedKey、Checkpoint 各自解决什么？
 
 MD5 只描述视频内容。同一视频生成复习笔记和操作步骤，可以复用 ASR、OCR、VideoContext 和 Chunk，**不能复用相同的 Plan 和 AnalysisResult**。如果只按 MD5 加锁，两个不同目标会被错误互斥，甚至返回错误结果。
@@ -1455,41 +760,11 @@ MD5 只描述视频内容。同一视频生成复习笔记和操作步骤，可�
 | completedKey | 消费者执行前 | 判断「同内容同目标是否已经完成」 |
 | Checkpoint + MySQL | 执行中和恢复时 | 判断任务内部从哪继续，并保存最终事实 |
 
-**代码细节：四个 Key 的完整字符串格式**
-
-全在 `utils/AnalysisTaskKeys.java:60-91`，参数都是 `(contentHash, goalDigest)`：
-
-```java
-active(contentHash, goalDigest)     → "analysis:active:"    + contentHash + ":" + goalDigest
-lock(contentHash, goalDigest)       → "lock:analysis:"      + contentHash + ":" + goalDigest
-completed(contentScope, goalDigest) → "analysis:completed:" + contentScope + ":" + goalDigest
-attempts(contentScope, goalDigest)  → "analysis:attempts:"  + contentScope + ":" + goalDigest
-```
-
-注意 `active` 和 `lock` 的第二个参数**必须是 contentHash**，而 `completed` 和 `attempts`
-的参数名叫 `contentScope`——因为修订任务会传 `"media-" + mediaId` 而不是真实 MD5
-（`AnalysisDispatchService.java:69` 的三元表达式）。这个差异是有意的：修订是同一条媒体的
 目标级操作，不应该因为 MD5 索引缺失而拿不到同一个键。
 
-**代码细节：两个参数各自从哪里来**
-
-| 参数 | 来源 | 方法 |
-| :--- | :--- | :--- |
-| `contentHash` | `MediaService.contentHash(mediaId)` 再经 `normalizeContentHash` 兜底 | `AnalysisDispatchService.java:143-146` |
-| `goalDigest` | `AnalysisTaskKeys.goalDigest(goal, mode)` | `AnalysisDispatchService.java:70` |
-
-投递方（`AnalysisDispatchService.submit`，`:63-102`）和消费方
-（`VideoAnalysisConsumer.onMessage`，`:92-98`）**各自独立重算这四个键**，
 消息体里只带 `contentHash` 和原始 `userGoal`，不带 GoalDigest——
 两边用同一份 `AnalysisTaskKeys` 代码保证一致。这是「同一个 Key 的另一半不落在消息里」的设计，
 避免消息体成为键的事实来源。
-
-**代码细节：activeKey 的值和 TTL**
-
-`setIfAbsent(activeKey, String.valueOf(mediaId), ACTIVE_TTL)`（`:72-73`），
-**值存的是 mediaId**，`ACTIVE_TTL = Duration.ofHours(6)`（`:31`）。
-所以除了判断「是否在处理中」，还能反查出是哪条媒体占着这个键——
-这也是 Q53 里「幂等键残留 6 小时」那个数字的出处。
 
 关键认知：**锁只能控制持锁期间的并发，不能证明任务历史上从未完成**；Redis Key 有 TTL，也不是永久事实。所以消费者拿锁后仍然要检查 completedKey 和 MySQL Checkpoint。真正的幂等来自「稳定业务 Key + 状态检查 + 可重复写」共同收敛，而不是单独依赖一把锁。
 
@@ -1499,21 +774,6 @@ JVM 锁只在单实例有效，消费者横向扩容后不同进程之间看不�
 
 当前获取锁时**没有指定固定 leaseTime**，因此持锁线程存活期间 WatchDog 会周期性延长锁过期时间；进程退出后续期停止，锁最终过期。释放前还会检查当前线程是否持有锁，避免误删其他线程重新获得的锁。
 
-**代码细节：项目里三把锁，语义各不相同**
-
-| 锁 Key | 获取方式 | 位置 | 语义 |
-| :--- | :--- | :--- | :--- |
-| `lock:upload:merge:{uploadId}` | `tryLock()` 不等待，失败抛 409 | `ChunkUploadService.java:115-120` | 合并期间互斥，快速失败 |
-| `lock:analysis:{contentHash}:{goalDigest}` | `tryLock()` 不等待，失败直接 return | `VideoAnalysisConsumer.java:104-108` | MQ 重投的瞬时并发 |
-| `lock:analysis-context:{contentHash}` | `tryLock(300, SECONDS)` **带等待** | `AiService.java:163` | 同视频并发构建上下文，只让一个跑 ASR/OCR |
-
-三把锁里**只有第三把带等待时间**，这是有意的：合并和目标锁是「别人在做就别做」，
-快速失败即可；上下文锁是「别人在做就等一等，做完我直接复用」，因为 ASR/OCR 是分钟级作业，
-等待比重复烧算力划算。等待超过 `CONTEXT_LOCK_WAIT_SECONDS = 300` 秒（`AiService.java:34`）后
-**不自己跑**，而是抛异常交给 MQ 重投（`:175-183`），计 `contextLockContentions`——
-注释里写明本地等待只负责消化短时争用，跨时间的重投才是兜底。
-
-`AiService` 里那段加锁后的二次检查逻辑值得单独看（`:164-173`）：
 **无论是否抢到锁都要重查，且必须先查自己的 Checkpoint 再查归属索引**，
 注释解释了原因——同一个 mediaId 换目标并发提交时，先完成者登记的 owner 正是自己，
 只查归属索引会被「owner == 自己」判空而漏掉，于是又重跑一遍完整 ASR/OCR。
@@ -1531,33 +791,6 @@ RocketMQ 按至少一次语义设计，消息可能因为消费超时、进程�
 - 第 3 次仍失败 → 把失败原因写入失败任务表，同时把原消息投递到**项目自建的失败主题**，阶段改为 DEAD_LETTERED。
 
 另外还有**永久失败**判定：沿异常 cause 链（最多 16 层）查找 IllegalArgumentException、SecurityException、NoSuchElementException，命中则直接收敛，不浪费后续的 ASR 和 LLM 调用。
-
-**代码细节：attemptsKey 的递增时机和计数语义**
-
-递增发生在**拿到锁、确认视频存在之后**，不是消息一进来就加：
-
-```java
-Long currentAttempt = redisTemplate.opsForValue().increment(attemptsKey);   // :113
-attempt = currentAttempt == null ? 1 : currentAttempt;
-redisTemplate.expire(attemptsKey, ACTIVE_TTL);                              // 重置为 6 小时
-```
-
-`increment` 每次 +1 并把 TTL 重置，所以 6 小时是**滑动窗口**而不是绝对过期。
-
-分流的三个条件（`:168-179`）：
-
-| 条件 | 结果 |
-| :--- | :--- |
-| `!permanent && attempt < 3` | 状态写 `RETRYING`，**保留 activeKey**，抛异常让 MQ 重投 |
-| `permanent \|\| attempt >= 3` | 落失败台账 + 转投失败主题，状态 `DEAD_LETTERED` |
-| 未拿到锁 / attempt == 0（递增前就失败） | 落到最后的 `throw`，交给 MQ |
-
-`isPermanentFailure`（`:303-317`）遍历 cause 链时有个**自引用保护**：
-`if (current.getCause() == current) break;`（`:313`）防御异常把自己设为自己的 cause 导致死循环。
-注释里还专门说明 `NumberFormatException` 也被算作永久失败（它是 `IllegalArgumentException`
-的子类），因为「解析脏数据是确定性失败，重投拿到的还是同一份数据」。
-
-`finally` 里的清理（`:205-212`）用 `retrying` 标志区分：
 
 ```java
 if (!retrying) redisTemplate.delete(List.of(activeKey, attemptsKey));
@@ -1577,59 +810,12 @@ if (lock.isHeldByCurrentThread()) lock.unlock();
 
 毒消息在 try 之前返回，走不到 finally，所以要单独清理 activeKey，否则幂等键会残留 6 小时，用户之后所有重复提交都会被判 DUPLICATE。
 
-**代码细节：结构校验的四个条件和 ACK 判据**
-
-`rejectionReason(msg)`（`:216-222`）检查四件事，任一条不过就是毒消息：
-
-```java
-msg == null                              → "消息体为空"
-msg.getMediaId() == null                 → "缺少 mediaId"
-goal 为 null 或 blank                     → "缺少分析目标"
-!msg.hasSupportedAction()                → "不支持的 action=" + action
-```
-
-`discardPoisonMessage`（`:232-261`）里两个独立的 boolean 标志 `recorded` / `deadLettered`
-分别标记两条出路是否成功，**只有两个都是 false 才拒绝确认**：
-
-```java
-if (!recorded && !deadLettered) {
-    throw new IllegalStateException("毒消息无法收敛：失败台账与失败主题均不可用，拒绝确认以避免消息丢失", error);
-}
-releasePoisonTaskState(msg);
-```
-
-还有个细节：`msg == null` 时 `discardPoisonMessage` 直接 `return`（`:234`），
-**不写台账、不转投、也不补清理**——因为连 mediaId 都没有，四条 Key 一个都算不出来。
-这种情况只能留下日志，是唯一「纯日志丢弃」的分支。
-
-日志隐私也做了处理：`describe(msg)`（`:290-296`）只打印 mediaId、action、contentHash
 和 **goalLength**（目标文本的长度，不是内容），注释说明是为了避免长文本或用户敏感内容进日志。
 
 ### Q59：SSE 断开、消息积压或视频被删除时，业务状态怎么闭环？
 
 **SSE 断开不会丢任务**。MQ 投递成功表示任务已经被 Broker 接收，SSE 只是用户通知。事件发布失败时系统记录日志，不会把任务伪装成投递失败，也不会删除 activeKey 让用户重复提交。前端 SSE 断线会指数退避重连，每次订阅先返回当前 MySQL / Checkpoint 状态，因此能恢复当前进度和终态。当前没有持久化完整事件日志，断线期间的中间事件可能看不到，但最终业务状态不依赖 SSE。
 
-**代码细节：投递成功和事件发布的分界线**
-
-`AnalysisDispatchService.submit`（`:83-100`）的顺序是：
-`rocketMQTemplate.convertAndSend(...)` 成功之后，**才**发 QUEUED 事件，
-并且事件发布**单独包一层 try/catch**：
-
-```java
-try {
-    taskEventService.publishAnalysis(mediaId, goal, resolvedMode, ...);
-} catch (RuntimeException eventError) {
-    // MQ 已经接单，通知失败不能把任务伪装成投递失败。
-    log.warn("analysis_queued_event_failed ...");
-}
-return SubmissionResult.ACCEPTED;
-```
-
-对比**投递异常**的分支（`:86-91`）会执行三件事：删 `activeKey`、撤销暂存修订、返回 FAILED。
-两条路径的区别就是「MQ 接没接单」——接了单就只记日志，没接单才回滚。这个区分可以作为一个
-「状态机边界在哪里」的具体例子。
-
-**当前状态怎么恢复**：SSE 订阅时（`TaskEventService.subscribe`，`:52-66`）会把
 emitter 注册进 `ConcurrentHashMap` 后**立刻发一条初始事件**，前端据此渲染首屏；
 真正的「当前状态」由 `GET /analysis/analysis-status?id=&goal=&mode=` 提供，
 它读 MySQL / Checkpoint，不依赖事件流。所以断线重连的完整流程是
@@ -1658,33 +844,6 @@ emitter 注册进 `ConcurrentHashMap` 后**立刻发一条初始事件**，前�
 - 用户级 `limit:ai:user:{userId}`：默认每分钟最多 5 次
 - 全局 `limit:ai:global`：默认每分钟最多 30 次
 - 两个许可都拿到后才能发送 MQ，多实例共享 Redis 中的同一配额
-
-**代码细节：两行常量和一个方法**
-
-```java
-USER_REQUESTS_PER_MINUTE   = 5;    // AnalysisDispatchService.java:29
-GLOBAL_REQUESTS_PER_MINUTE = 30;   // :30
-ACTIVE_TTL = Duration.ofHours(6);  // :31
-
-// tryAcquireQuota，:132-141
-userLimiter.trySetRate(RateType.OVERALL, USER_REQUESTS_PER_MINUTE, 1, RateIntervalUnit.MINUTES);
-if (!userLimiter.tryAcquire()) return false;
-globalLimiter.trySetRate(RateType.OVERALL, GLOBAL_REQUESTS_PER_MINUTE, 1, RateIntervalUnit.MINUTES);
-return globalLimiter.tryAcquire();
-```
-
-`RateType.OVERALL` 表示**全局限额而不是单连接限额**，这是多实例共享同一配额的关键；
-用 `trySetRate` 而不是 `setRate`，意味着**只在限流器不存在时初始化**，
-不会每次请求都重置已有计数器（否则限额永远无法耗尽）。
-
-**顺序是「先用户后全局」，这个方向有代价**：用户许可先被消耗，若全局许可失败，
-用户那一次配额不会归还。代码选择接受这个损耗换取简单（见 Q63），
-要精确的话应该反过来先拿全局。
-
-追问和证据检索走的是同一个 `requireAiQuota`（`:119-130`），
-所以它们和分析任务**共用 5/30 这一组配额**，不能绕过成本护栏。
-`requireAiQuota` 对 Redis 异常的处理是 fail closed：转成
-`SERVICE_UNAVAILABLE`（`:127-129`），不是放行。
 
 还有第二组别混：模式路由接口是**用户 10 次 / 分钟 + 全局 60 次 / 分钟**。追问和证据检索也会复用分析配额，避免绕过成本护栏。
 
@@ -1721,21 +880,6 @@ API 内部重试保持当前任务上下文不变，它的粒度是一次具体�
 
 必须讲准确：旧文档把第三方 API 指数退避完全写成 RocketMQ 的 10 秒、30 秒、1 分钟阶梯延迟，那是两层机制混淆。正确口径是 API 内部做短退避，任务级失败再由 MQ 重投，最后进入项目自建失败主题。
 
-**代码细节：三层的具体参数**
-
-| 层 | 最大次数 | 退避 | 可重试判定 |
-| :--- | :--- | :--- | :--- |
-| ASR 分片 | `MAX_ATTEMPTS = 3` | `1_000L << attempt` = 1s、2s | 仅 `IOException`；429 / ≥500 包装成 `RetryableAsrException` |
-| LLM 调用 | `MAX_MODEL_ATTEMPTS = 3` | 同上 1s、2s | 408 / 429 / ≥500 可重试，其他 4xx 抛 `IllegalArgumentException` |
-| MQ 任务 | `MAX_DELIVERY_ATTEMPTS = 3` | **无退避**，由 Broker 重投节奏决定 | 非永久失败且 attempt < 3 |
-
-三层退避值一样、判定口径也基本一致，但**实现是三份独立代码**（`AliyunAsrUtils:94-101`、
-`DeepSeekUtils:465-467`、`VideoAnalysisConsumer:168-178`），没有抽公共组件。
-面试被问「能不能统一」时可以答：可以抽成一个 `RetryPolicy`，但三者失败成本和
-计数载体（第三方 SDK / 本地状态 / Redis 计数）不同，第一版优先保证各自的边界清晰。
-
-**LLM 侧比旧文档多一层，要讲全**：`chat()` 的最外层重试之下，
-`structuredChat`（`DeepSeekUtils.java:380-388`）还有一层**只针对 JSON 解析失败的格式修复**——
 追加「请严格返回合法 JSON」再问一次。所以一次模型节点最坏情况是
 3 次网络重试 × 2 次解析尝试，不是 3 次调用。这个乘法是真实存在的放大。
 
@@ -1745,28 +889,6 @@ ASR 当前只对网络异常、429 和 5xx 重试，其他 4xx 直接失败，�
 
 更合理的分类是：超时、连接失败、429 和部分 5xx 可重试；鉴权失败、参数错误、模型不存在和内容策略拒绝直接失败；结构化 JSON 解析只做一次格式修复。错误分类比「任何异常都重试」更能防止重试放大。
 
-**代码细节：分类器长什么样**
-
-`DeepSeekUtils.isRetriableModelFailure`（`:450-463`）的判定顺序：
-
-```java
-if (current instanceof NonRetriableException) return false;   // 显式标记永久失败
-if (current instanceof RetriableException)    return true;    // 显式标记可重试
-if (current instanceof HttpException http)                    // 按状态码
-    return http.statusCode() == 408 || == 429 || >= 500;
-// 其他类型继续沿 cause 链向下找，最多 8 层
-```
-
-关键是**先查两个显式标记类再查状态码**，允许调用方主动把某个异常定性。
-`MAX_CAUSE_DEPTH = 8` 和消费者侧的 16 是两个独立常量，容易记混。
-
-对比 ASR 侧（`AliyunAsrUtils:85-90`）只有**两分支**：429/≥500 → `RetryableAsrException`，
-其他非 2xx → `IllegalArgumentException`。没有显式标记类，也没有 408 分支。
-**两边不对称是当前的真实状态**，被问到「为什么 LLM 能重试 408 而 ASR 不能」时，
-诚实回答是「没有刻意设计，是两次独立实现的差异，可以对齐」。
-
-`SegmentedTranscriptionService` 在抛「所有 ASR 分片均处理失败」时
-**显式带上 `lastSegmentError` 作为 cause**（`:59-64`），注释解释了原因：
 丢掉 cause 后消费者只看得到笼统的 `IllegalStateException`，
 参数错误会被误判成抖动而反复重试整条 ASR + LLM 流水线。这是「cause 链保真」的实例。
 
@@ -1810,52 +932,12 @@ SETNX 只有「占位 / 幂等拦截」语义，没有自动续期和归属校�
 
 两个任务分支并行执行，用 CompletableFuture 组合汇合；配独立有界线程池，避免公共 ForkJoinPool 被阻塞、避免无上限堆积。什么时候该拆 Topic 或拆服务：当两路需要独立硬件或独立扩容时。
 
-**代码细节：ASR/OCR 两路用的是 `Future`，不是 `CompletableFuture`**
-
-这一点要讲准确，否则容易被追问倒。`VideoContextService.submitBranch`（`:166-184`）调的是
-`ThreadPoolTaskExecutor.submit(...)`，返回 **`java.util.concurrent.Future`**，
-汇合用的是 `future.get(remainingNanos, NANOSECONDS)`（`awaitBranch`，`:186-191`）。
-`CountDownLatch` 出现在 `branchesFinished`（`:74`），用于超时取消后等待分支真正退出。
-
-**但 `CompletableFuture` 在项目里确实存在，只是用在别处**，别把整个项目说成没用它：
-
-| 位置 | 用法 |
-| :--- | :--- |
-| `controller/AnalysisController.java:263-265` | 追问和证据检索走 `CompletableFuture.supplyAsync(..., aiTaskExecutor)`，接口返回 `CompletableFuture<Result<T>>` |
-| `service/VideoContextService.java:182` | `executor.submit` 被拒绝时，用 `CompletableFuture.completedFuture(BranchResult.failure(e))` 构造一个「已完成但失败」的结果，保证两条分支的**返回类型一致** |
-
-所以正确的说法是：**两路模态分支用 `Future` 汇合，交互式接口用 `CompletableFuture` 异步化**。
-`VideoContextService:182` 那个用法是个好细节——线程池队列满被 `AbortPolicy` 拒绝时，
-不抛异常而是把拒绝包装成 `BranchResult.failure`，让 `finishContext` 的统一降级逻辑接管，
-而不是让一次线程池拒绝直接打到用户。
-
-如果要把两路也改成 `CompletableFuture`，自然写法是 `supplyAsync(..., asrExecutor)` 配
-`thenCombine`；但当前两路**互不依赖**，`CompletableFuture` 的编排能力用不上，
-`Future` 反而更直白。
-
-四组线程池的实际用途也要对齐（`config/ThreadPoolConfig.java`）：
-
-| 线程池 | 谁在用 |
-| :--- | :--- |
-| `aiTaskExecutor` | 分析任务主线程、`TranscriptionTaskService` 的 `@Async`、控制器的交互式调用 |
-| `asrExecutor` | `VideoContextService` 提交**整条 ASR 分支**（不是单个分片） |
-| `ocrExecutor` | `VideoContextService` 提交**整条 OCR 分支** |
-| `modelCallExecutor` | `DeepSeekUtils` 的模型调用 |
-
-`ocrExecutor` 的核心/最大线程数都是 `min(8, max(1, cores/2))`（`:26`），
 **core == max** 且队列只有 20，所以它是「按 CPU 定量的固定并发」，
 不像前两个有 4→8 的弹性扩容空间。
 
 ### Q74：FFmpeg 的 select 过滤器、scene score、showinfo 是干什么的？
 
 `select='gt(scene,0.35)'` 按场景变化选帧；`showinfo` 把每帧的 `pts_time` 打到日志，Java 解析后换算成毫秒。这是 OCR 文本能回到视频时间轴的机制。场景检测负责找「可能发生有效变化」的画面，并不负责理解画面内容。
-
-**代码细节**：`select` 过滤器的表达式在 `VideoContextService.java:213`，
-`pts_time` 的解析正则是 `PTS_TIME = Pattern.compile("pts_time:([0-9.]+)")`（`:43`）。
-FFmpeg 的 stderr 被合并进日志并重定向到临时文件（`runCommand`，`:307-332`），
-超时是 `process.waitFor(15, TimeUnit.MINUTES)`（`:315`）——比 ASR 侧同一常量
-在 `SegmentedTranscriptionService.java:92` 的值一样，但两处硬编码，没有抽公共常量。
-命令执行完在 `finally` 里删日志文件（`:330`）。
 
 ### Q75：什么是感知哈希（dHash），为什么能去重？
 
@@ -1869,49 +951,15 @@ Embedding 把文本映射成向量，语义相近的文本向量夹角小，用�
 
 SSE 是单向的服务端推流，走 HTTP 长连接，自动重连机制简单，适合「服务端 → 前端」的任务进度推送。WebSocket 是双向全双工，这里不需要客户端推流。轮询浪费请求且有延迟。断线后前端指数退避重连，重新订阅时先返回当前状态。
 
-**代码细节：事件名、载荷和多实例广播**
-
-`TaskEventService` 里的常量（`:27-32`）：
-`ANALYSIS = "analysis"`、`TRANSCRIPTION = "transcription"`、
-**Redis 频道 `dovideo:task-events`**、`STREAM_TIMEOUT_MS = 30 * 60 * 1000L`（30 分钟）。
-
-SSE 事件名是 **`"task-status"`**（`:116-128`），载荷是：
-
-```java
-record TaskEvent(TaskStatus.State state, String result, String message, TaskStage stage)
-```
-
-订阅 Key 的格式（`:137-142`）：`{type}:{mediaId}:{suffix}`，
-其中 `suffix` 对分析任务是 `goalDigest(goal, mode)`，对转写任务是固定字符串 `"default"`。
-**所以不同目标、不同模式的 SSE 订阅天然隔离**，不会互相串进度。
-
-多实例广播的做法值得讲：发布时先 `convertAndSend` 到 Redis 频道，
-**如果本地没有订阅者或发布抛异常，就退化为 `publishLocal` 只发本机**（`:68-96`）。
-其他实例收到频道消息后各自 `publishLocal`（`onMessage`，`:98-108`）。
-这个设计的含义是：**进度推送尽力而为，不保证送达**——Redis 挂了本实例的用户仍能收到进度，
-但跨实例的推送会丢。由于前端重连时会先拿当前状态（见下方 Q59），丢了中间事件不影响最终态。
-
-终态事件发送后 emitter 会被 `complete()` 关闭（`:116-128` 里的 `event.terminal()` 分支），
-避免连接悬挂。
+断线重连和心跳都对单条长连接更友好，也避免了连接悬挂。
 
 ### Q78：什么是 Flyway？项目里怎么用？
 
 数据库迁移工具，按版本顺序执行 SQL，保证表结构可以版本化管理。项目启动时会自动初始化所需数据表。
 
-**代码细节**：迁移脚本在 `src/main/resources/db/migration/`，命名规则 `V{n}__{description}.sql`。
-当前有 `V1__create_core_tables.sql`（`users` / `media_files` / `agent_checkpoints` 等核心表）
-和 `V2__add_media_content_hash.sql`（给 `media_files` 加 `content_hash` 列）。
-配置是 `spring.flyway.enabled=true`、`locations=classpath:db/migration`、
-**`baseline-on-migrate=true`**——后者让 Flyway 能接管一个已有数据的库，否则在非空库上启动会直接失败。
-
 ### Q79：MyBatis-Plus 的 upsert 是干什么的？
 
 存在则更新、不存在则插入，依赖唯一键。项目里 Checkpoint 用 upsert 收敛重复执行的结果，让同一任务的多次执行落库到同一行。
-
-**代码细节：项目里其实是手写 SQL，不是 MyBatis-Plus 的 API**
-
-这点容易被追问，要讲准确。`agent_checkpoints` 表的 upsert 没走 MyBatis-Plus，
-而是 `mapper/AgentCheckpointMapper.java:20-28` 的注解 SQL：
 
 ```sql
 INSERT INTO agent_checkpoints (media_id, checkpoint_key, stage, payload)
@@ -1990,23 +1038,6 @@ Checkpoint 决定「**从哪继续**」，MQ 决定「**会不会再来一次**�
 
 所以简历写「GB 级」是成立的，但**不能声称支持任意 10GB 文件**——要支持更大视频，必须同时调整分片上限、服务端请求体上限、本地临时磁盘预算和合并方式，不是改一个 totalChunks 就行。
 
-**代码细节：这几个数字在代码里的位置**
-
-| 约束 | 常量 / 配置 | 值 |
-| :--- | :--- | :--- |
-| 单分片上限 | `ChunkUploadService.MAX_CHUNK_BYTES`（`:39`） | `5L * 1024 * 1024` |
-| 分片总数上限 | `ChunkUploadService.MAX_TOTAL_CHUNKS`（`:40`） | `410` |
-| HTTP 请求体上限 | `spring.servlet.multipart.max-file-size` | `2048MB` |
-| 请求总大小 | `spring.servlet.multipart.max-request-size` | `2048MB` |
-| VideoContext 总 deadline | `VideoContextService.java:90` 硬编码 | 60 分钟 |
-| FFmpeg 单次执行超时 | `SegmentedTranscriptionService.java:92` / `VideoContextService.java:315` | 15 分钟 |
-| AgentLoop 时长预算 | `agent.budget.max-duration-ms` | 120000 ms |
-
-**注意 410 × 5MB = 2050MB，比 multipart 的 2048MB 略大**，
-所以理论上限其实是 HTTP 层的 2048MB 先触发，410 片这个数字留了一点余量。
-这不是设计巧合就是没对齐，被问到可以诚实说两者是同量级约束，实际以先触发的为准。
-
-另一个点：`MAX_TOTAL_CHUNKS = 410` 同时被用来校验 `initialize` 时的 `totalChunks` 参数（`:60-62`），
 所以**前端必须按 ≤410 来分片**，超过直接抛 `IllegalArgumentException`。
 简历如果写了具体分片数，要和这个常量对上。
 
@@ -2027,27 +1058,6 @@ Checkpoint 决定「**从哪继续**」，MQ 决定「**会不会再来一次**�
 
 四组都用 `AbortPolicy`，队列满直接拒绝，避免无上限堆积拖垮进程。数据库连接池 Hikari 默认 10。
 
-**代码细节：线程池参数是硬编码的，不是配置项**
-
-`config/ThreadPoolConfig.java:14-33` 里四组线程池全部写死在代码里，
-用同一个私有工厂方法 `executor(prefix, coreSize, maxSize, queueCapacity)`（`:35-46`）构造。
-共同设置：`AbortPolicy`、`setWaitForTasksToCompleteOnShutdown(true)`、
-`setAwaitTerminationSeconds(30)`。
-
-线程名前缀分别是 `AI-Thread-`、`ASR-Thread-`、`OCR-Thread-`、`LLM-Thread-`，
-排查线程栈时可以直接对应到用途。**改并发度要改代码重新编译**，
-不是改一行配置——被问到「怎么调优」时这是要承认的边界。
-
-队列容量也值得对比：`aiTaskExecutor` 100、`asrExecutor` 50、`ocrExecutor` 20、
-`modelCallExecutor` 20。AI 主任务队列最长，因为它承接的是用户提交；
-模型调用队列只有 20，因为每次调用都占着第三方配额，堆积没有意义。
-
-请求入口有全局限流 **30 次/分钟**，这实际上就是当前单机部署的吞吐上限——**不是处理能力只有 30，而是有意把进入队列的速率压在 30/分钟以内**，避免无效任务排队烧资源。
-
-效率上能讲的是：ASR 和 OCR 两路并行，总耗时接近较慢的那一路而不是相加；同一视频的解析结果跨目标复用，第二个目标不用重新转写。
-
-**更正：长视频的 ASR 分片是「串行逐个调用」，不是「并发提交」。**
-`SegmentedTranscriptionService.transcribe`（`:44-58`）是一个普通 `for` 循环，
 第 `i` 片调完 `aliyunAsrUtils.audioToText` 才处理第 `i+1` 片。
 切成 60 秒的作用是**把失败范围缩小到单片**（单片失败只记 `asrSegmentFailures` 继续），
 以及**让时间戳可以由序号推算**，不是为了提速。这一点如果被追问「120 次调用怎么扛」，
