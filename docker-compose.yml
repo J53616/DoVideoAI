@@ -63,6 +63,16 @@ services:
       JAVA_OPT_EXT: -server -Xms256m -Xmx256m -Xmn128m
     command: sh mqnamesrv
 
+  # Docker 创建命名卷时目录属主为 root，但 RocketMQ 镜像以 rocketmq 用户运行。
+  # 先修正两个可写卷的属主，避免 Broker 在首次启动时因无法创建日志/存储文件而退出。
+  rmqinit:
+    image: apache/rocketmq:5.3.4
+    user: root
+    entrypoint: ["/bin/sh", "-c", "chown -R 3000:3000 /home/rocketmq/store /home/rocketmq/logs"]
+    volumes:
+      - rocketmq-store:/home/rocketmq/store
+      - rocketmq-logs:/home/rocketmq/logs
+
   rmqbroker:
     image: apache/rocketmq:5.3.4
     ports:
@@ -79,7 +89,10 @@ services:
       - rocketmq-logs:/home/rocketmq/logs
     command: sh mqbroker -n rmqnamesrv:9876 -c /home/rocketmq/broker.conf
     depends_on:
-      - rmqnamesrv
+      rmqnamesrv:
+        condition: service_started
+      rmqinit:
+        condition: service_completed_successfully
 
 volumes:
   rocketmq-store:
