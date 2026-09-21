@@ -43,13 +43,16 @@ public class SegmentedTranscriptionService {
         RuntimeException lastSegmentError = null;
         for (int i = 0; i < audioFiles.size(); i++) {
             Path audioFile = audioFiles.get(i);
+            long asrStarted = System.nanoTime();
             try {
                 telemetry.increment(traceId, "asrCalls", 1);
                 String text = aliyunAsrUtils.audioToText(audioFile.toString());
+                telemetry.toolCall(traceId, "ASR", asrStarted, true);
                 if (text != null && !text.isBlank()) {
                     result.add(new TranscriptSegment(i * SEGMENT_MS, (i + 1) * SEGMENT_MS, text));
                 }
             } catch (RuntimeException e) {
+                telemetry.toolCall(traceId, "ASR", asrStarted, false);
                 failedSegments++;
                 lastSegmentError = e;
                 telemetry.increment(traceId, "asrSegmentFailures", 1);

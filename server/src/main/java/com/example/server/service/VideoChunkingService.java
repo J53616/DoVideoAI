@@ -79,9 +79,13 @@ public class VideoChunkingService {
     }
 
     private List<Double> embed(String text) {
+        long started = System.nanoTime();
         try {
-            return embeddingUtils.embed(text);
+            List<Double> embedding = embeddingUtils.embed(text);
+            telemetry.toolCallCurrent("EMBEDDING", started, true);
+            return embedding;
         } catch (RuntimeException e) {
+            telemetry.toolCallCurrent("EMBEDDING", started, false);
             telemetry.incrementCurrent("embeddingFallbacks", 1);
             return List.of();
         }

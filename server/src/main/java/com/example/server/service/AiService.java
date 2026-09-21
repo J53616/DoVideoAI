@@ -5,6 +5,7 @@ import com.example.server.dto.AgentState;
 import com.example.server.dto.AnalysisMode;
 import com.example.server.dto.TaskStatus;
 import com.example.server.dto.TaskStage;
+import com.example.server.dto.TraceContext;
 import com.example.server.dto.VideoContext;
 import com.example.server.dto.VideoEvidenceHit;
 import com.example.server.entity.MediaFile;
@@ -73,12 +74,21 @@ public class AiService {
 
     /** 兼容旧调用方:未指定模式时按 GENERAL 分析。 */
     public void asyncAnalyze(Long mediaId, String userGoal) {
-        asyncAnalyze(mediaId, userGoal, AnalysisMode.GENERAL);
+        asyncAnalyze(mediaId, userGoal, AnalysisMode.GENERAL, null);
     }
 
     public void asyncAnalyze(Long mediaId, String userGoal, AnalysisMode mode) {
+        asyncAnalyze(mediaId, userGoal, mode, null);
+    }
+
+    public void asyncAnalyze(Long mediaId,
+                             String userGoal,
+                             AnalysisMode mode,
+                             TraceContext traceContext) {
         AnalysisMode resolvedMode = mode == null ? AnalysisMode.GENERAL : mode;
-        String traceId = telemetry.start(mediaId, userGoal, resolvedMode);
+        String traceId = traceContext == null
+                ? telemetry.start(mediaId, userGoal, resolvedMode)
+                : telemetry.resumeTask(traceContext, userGoal, resolvedMode);
         telemetry.bind(traceId);
         TaskStage currentStage = TaskStage.VIDEO_CONTEXT;
         MediaFile mediaFile = mediaFileMapper.selectById(mediaId);

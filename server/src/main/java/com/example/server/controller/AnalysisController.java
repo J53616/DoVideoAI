@@ -237,6 +237,27 @@ public class AnalysisController {
     }
 
     /**
+     * 查询持久化 Trace。mediaId 必填并先校验归属；传 traceId/taskId 精确查询，均不传则返回最近历史。
+     */
+    @GetMapping("/agent-traces")
+    public Result<Object> agentTraces(
+            @RequestParam Long id,
+            @RequestParam(required = false) String traceId,
+            @RequestParam(required = false) String taskId,
+            @RequestParam(defaultValue = "20") int limit,
+            @RequestAttribute(AuthService.REQUEST_USER_ID) Long userId) {
+        mediaService.requireOwnedMedia(id, userId);
+        boolean hasTraceId = traceId != null && !traceId.isBlank();
+        boolean hasTaskId = taskId != null && !taskId.isBlank();
+        if (hasTraceId && hasTaskId) {
+            throw new IllegalArgumentException("traceId 和 taskId 只能选择一个");
+        }
+        if (hasTraceId) return Result.ok(telemetry.byTraceId(id, traceId.trim()));
+        if (hasTaskId) return Result.ok(telemetry.byTaskId(id, taskId.trim()));
+        return Result.ok(telemetry.byMediaId(id, limit));
+    }
+
+    /**
      * 请求参数的规整 + 校验：既做 trim 归一（结果参与幂等 key 计算，不能省），
      * 又限制长度。请求体（DTO）改用 Bean Validation，参数这里保留是因为它承担了归一职责。
      */

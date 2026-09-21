@@ -80,10 +80,13 @@ public class VideoEvidenceRetrievalService {
     }
 
     public void index(Long mediaId, List<VideoChunk> chunks) {
+        long started = System.nanoTime();
         try {
             vectorStore.upsert(mediaId, chunks);
+            telemetry.toolCallCurrent("VECTOR_UPSERT", started, true);
             telemetry.incrementCurrent("vectorStoreWrites", chunks.size());
         } catch (RuntimeException e) {
+            telemetry.toolCallCurrent("VECTOR_UPSERT", started, false);
             // 向量库挂了仍可走内存向量和关键词，别让检索基础设施拖垮分析主链路。
             telemetry.incrementCurrent("vectorStoreFallbacks", 1);
         }
@@ -105,10 +108,13 @@ public class VideoEvidenceRetrievalService {
     private Map<String, Double> vectorScores(Long mediaId, List<Double> queryEmbedding) {
         Map<String, Double> scores = new LinkedHashMap<>();
         if (mediaId == null || queryEmbedding.isEmpty()) return scores;
+        long started = System.nanoTime();
         try {
             vectorStore.search(mediaId, queryEmbedding, TOP_K * 2).forEach(hit ->
                     scores.put(hit.startMs() + ":" + hit.endMs(), hit.score()));
+            telemetry.toolCallCurrent("VECTOR_SEARCH", started, true);
         } catch (RuntimeException e) {
+            telemetry.toolCallCurrent("VECTOR_SEARCH", started, false);
             telemetry.incrementCurrent("vectorStoreFallbacks", 1);
         }
         return scores;
@@ -208,9 +214,13 @@ public class VideoEvidenceRetrievalService {
     }
 
     private List<Double> embed(String text) {
+        long started = System.nanoTime();
         try {
-            return embeddingUtils.embed(text);
+            List<Double> embedding = embeddingUtils.embed(text);
+            telemetry.toolCallCurrent("EMBEDDING", started, true);
+            return embedding;
         } catch (RuntimeException e) {
+            telemetry.toolCallCurrent("EMBEDDING", started, false);
             telemetry.incrementCurrent("embeddingFallbacks", 1);
             return List.of();
         }

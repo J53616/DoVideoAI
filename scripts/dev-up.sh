@@ -13,7 +13,7 @@ done
 
 if [[ ! -f .env ]]; then
   cp .env.example .env
-  echo "Created .env. Set SILICONFLOW_API_KEY and replace the example passwords, then run this script again."
+  echo "Created .env. Set LLM_API_KEY, SILICONFLOW_API_KEY and replace the example passwords, then run this script again."
   exit 1
 fi
 
@@ -23,7 +23,8 @@ source .env
 set +a
 
 for variable in \
-  DB_PASSWORD MYSQL_ROOT_PASSWORD REDIS_PASSWORD MINIO_SECRET_KEY QDRANT_API_KEY SILICONFLOW_API_KEY; do
+  DB_PASSWORD MYSQL_ROOT_PASSWORD REDIS_PASSWORD MINIO_SECRET_KEY QDRANT_API_KEY \
+  LLM_API_KEY SILICONFLOW_API_KEY; do
   value="${!variable:-}"
   if [[ -z "$value" || "$value" == change-* ]]; then
     echo "Set a non-example value for $variable in .env" >&2

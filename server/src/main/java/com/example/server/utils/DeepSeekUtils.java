@@ -15,7 +15,9 @@ import dev.langchain4j.exception.HttpException;
 import dev.langchain4j.exception.NonRetriableException;
 import dev.langchain4j.exception.RetriableException;
 import dev.langchain4j.model.chat.ChatModel;
+import dev.langchain4j.model.chat.response.ChatResponse;
 import dev.langchain4j.model.openai.OpenAiChatModel;
+import dev.langchain4j.model.output.TokenUsage;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
@@ -52,12 +54,12 @@ public class DeepSeekUtils {
     private final double inputPricePerMillion;
     private final double outputPricePerMillion;
 
-    public DeepSeekUtils(@Value("${ai.deepseek.api-key}") String apiKey,
-                         @Value("${ai.deepseek.base-url}") String baseUrl,
-                         @Value("${ai.deepseek.model:deepseek-ai/DeepSeek-V3.2}") String modelName,
-                         @Value("${ai.deepseek.timeout-seconds:300}") long timeoutSeconds,
-                         @Value("${ai.deepseek.input-price-per-million:0}") double inputPricePerMillion,
-                         @Value("${ai.deepseek.output-price-per-million:0}") double outputPricePerMillion,
+    public DeepSeekUtils(@Value("${ai.llm.api-key}") String apiKey,
+                         @Value("${ai.llm.base-url}") String baseUrl,
+                         @Value("${ai.llm.model:deepseek-v4-pro}") String modelName,
+                         @Value("${ai.llm.timeout-seconds:300}") long timeoutSeconds,
+                         @Value("${ai.llm.input-price-per-million:0}") double inputPricePerMillion,
+                         @Value("${ai.llm.output-price-per-million:0}") double outputPricePerMillion,
                          @Value("${agent.budget.max-estimated-cost:0}") double maxEstimatedCost,
                          AgentTelemetry telemetry,
                          ObjectMapper objectMapper,
@@ -391,12 +393,15 @@ public class DeepSeekUtils {
         RuntimeException lastError = null;
         for (int attempt = 0; attempt < MAX_MODEL_ATTEMPTS; attempt++) {
             long started = System.nanoTime();
+            telemetry.incrementCurrent("modelCallAttempts", 1);
             try {
-                String response = invokeModel(prompt);
+                ModelInvocation invocation = invokeModel(prompt);
+                String response = invocation.text();
                 if (response == null || response.isBlank()) {
                     throw new RetriableException("模型返回空响应");
                 }
                 telemetry.modelCall(stage, SYSTEM_POLICY + "\n" + prompt, response,
+                        invocation.inputTokens(), invocation.outputTokens(),
                         inputPricePerMillion, outputPricePerMillion, started);
                 return response;
             } catch (RuntimeException e) {
@@ -410,20 +415,30 @@ public class DeepSeekUtils {
                     }
                     break;
                 }
+                telemetry.incrementCurrent("modelCallRetries", 1);
                 waitBeforeRetry(attempt);
             }
         }
         throw new IllegalStateException("模型调用达到最大重试次数", lastError);
     }
 
-    private String invokeModel(String prompt) {
+    private ModelInvocation invokeModel(String prompt) {
         long remainingBudgetMs = AgentExecutionBudget.remainingMillis();
         long timeoutMs = Math.min(modelTimeoutMs, remainingBudgetMs);
-        Future<String> future;
+        Future<ModelInvocation> future;
         try {
-            future = modelCallExecutor.submit(() -> chatModel.chat(
-                    SystemMessage.from(SYSTEM_POLICY),
-                    UserMessage.from(prompt)).aiMessage().text());
+            future = modelCallExecutor.submit(() -> {
+                ChatResponse response = chatModel.chat(
+                        SystemMessage.from(SYSTEM_POLICY),
+                        UserMessage.from(prompt));
+                TokenUsage usage = response.tokenUsage();
+                Long inputTokens = usage == null || usage.inputTokenCount() == null
+                        ? null : usage.inputTokenCount().longValue();
+                Long outputTokens = usage == null || usage.outputTokenCount() == null
+                        ? null : usage.outputTokenCount().longValue();
+                return new ModelInvocation(
+                        response.aiMessage().text(), inputTokens, outputTokens);
+            });
         } catch (RejectedExecutionException e) {
             throw new RetriableException("模型调用线程池繁忙", e);
         }
@@ -446,6 +461,9 @@ public class DeepSeekUtils {
             throw new IllegalStateException("模型调用失败", cause);
         }
     }
+
+    /** 模型正文和厂商返回的 Usage 必须一起向上传递，避免在提取文本时丢失真实 Token。 */
+    private record ModelInvocation(String text, Long inputTokens, Long outputTokens) { }
 
     private boolean isRetriableModelFailure(Throwable error) {
         Throwable current = error;

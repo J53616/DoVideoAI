@@ -33,7 +33,7 @@ public class AliyunAsrUtils {
             .retryOnConnectionFailure(true)
             .build();
 
-    public AliyunAsrUtils(@Value("${ai.deepseek.api-key}") String apiKey,
+    public AliyunAsrUtils(@Value("${ai.asr.api-key}") String apiKey,
                           @Value("${ai.asr.url}") String transcriptionUrl,
                           @Value("${ai.asr.model}") String model) {
         this.apiKey = apiKey;

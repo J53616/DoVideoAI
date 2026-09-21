@@ -6,6 +6,7 @@ import com.example.server.dto.AnalysisMode;
 import com.example.server.dto.AnalysisTaskMsg;
 import com.example.server.dto.TaskStatus;
 import com.example.server.dto.TaskStage;
+import com.example.server.dto.TraceContext;
 import com.example.server.entity.MediaFile;
 import com.example.server.exception.BusinessException;
 import com.example.server.utils.AnalysisTaskKeys;
@@ -36,6 +37,7 @@ public class AnalysisDispatchService {
     private final RocketMQTemplate rocketMQTemplate;
     private final RedissonClient redissonClient;
     private final TaskEventService taskEventService;
+    private final AgentTelemetry telemetry;
     private final String analysisTopic;
 
     public AnalysisDispatchService(AiService aiService,
@@ -44,6 +46,7 @@ public class AnalysisDispatchService {
                                    RocketMQTemplate rocketMQTemplate,
                                    RedissonClient redissonClient,
                                    TaskEventService taskEventService,
+                                   AgentTelemetry telemetry,
                                    @Value("${rocketmq.topic.video-analysis:video-analysis-topic}")
                                    String analysisTopic) {
         this.aiService = aiService;
@@ -52,6 +55,7 @@ public class AnalysisDispatchService {
         this.rocketMQTemplate = rocketMQTemplate;
         this.redissonClient = redissonClient;
         this.taskEventService = taskEventService;
+        this.telemetry = telemetry;
         this.analysisTopic = analysisTopic;
     }
 
@@ -66,6 +70,7 @@ public class AnalysisDispatchService {
         String action = revision == null
                 ? AnalysisTaskMsg.START_ANALYSIS
                 : AnalysisTaskMsg.REVISE_ANALYSIS;
+        long dispatchStarted = System.nanoTime();
         String contentHash = revision == null ? contentHash(mediaId) : "media-" + mediaId;
         String goalDigest = AnalysisTaskKeys.goalDigest(goal, resolvedMode);
         String activeKey = AnalysisTaskKeys.active(contentHash, goalDigest);
@@ -73,22 +78,33 @@ public class AnalysisDispatchService {
                 activeKey, String.valueOf(mediaId), ACTIVE_TTL);
         if (!Boolean.TRUE.equals(accepted)) return SubmissionResult.DUPLICATE;
 
+        TraceContext traceContext = telemetry.startTask(
+                mediaId, mediaFile.getUserId(), goal, resolvedMode, action);
+
         try {
             if (!tryAcquireQuota(mediaFile.getUserId())) {
                 redisTemplate.delete(activeKey);
+                telemetry.stage(traceContext.traceId(), "DISPATCH", dispatchStarted, false);
+                telemetry.finish(traceContext.traceId(), "RATE_LIMITED");
                 return SubmissionResult.RATE_LIMITED;
             }
             // 旧结果先留着。消费者真正接手后再切 Checkpoint，MQ 投递失败时用户还有结果可看。
             if (revision != null) aiService.stageRevision(revision, resolvedMode);
             rocketMQTemplate.convertAndSend(
                     analysisTopic,
-                    new AnalysisTaskMsg(mediaId, action, contentHash, goal, resolvedMode.name()));
+                    new AnalysisTaskMsg(
+                            mediaId, action, contentHash, goal, resolvedMode.name(), traceContext));
         } catch (RuntimeException e) {
             redisTemplate.delete(activeKey);
             if (revision != null) aiService.cancelStagedRevision(mediaId, goal, resolvedMode);
+            telemetry.stage(traceContext.traceId(), "DISPATCH", dispatchStarted, false);
+            telemetry.finish(traceContext.traceId(), "DISPATCH_FAILED");
             log.error("analysis_dispatch_failed mediaId={} userId={}", mediaId, mediaFile.getUserId(), e);
             return SubmissionResult.FAILED;
         }
+
+        telemetry.stage(traceContext.traceId(), "DISPATCH", dispatchStarted, true);
+        telemetry.status(traceContext.traceId(), "QUEUED");
 
         try {
             taskEventService.publishAnalysis(mediaId, goal, resolvedMode,

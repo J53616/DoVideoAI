@@ -1,6 +1,8 @@
 package com.example.server.service;
 
 import com.example.server.dto.AnalysisMode;
+import com.example.server.dto.TraceContext;
+import com.example.server.repository.AgentTraceRepository;
 import com.example.server.utils.AnalysisTaskKeys;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -14,9 +16,11 @@ import java.time.Instant;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.DoubleAdder;
 import java.util.concurrent.atomic.LongAdder;
@@ -33,10 +37,14 @@ public class AgentTelemetry {
     private final ThreadLocal<String> currentTrace = new ThreadLocal<>();
     private final StringRedisTemplate redisTemplate;
     private final ObjectMapper objectMapper;
+    private final AgentTraceRepository traceRepository;
 
-    public AgentTelemetry(StringRedisTemplate redisTemplate, ObjectMapper objectMapper) {
+    public AgentTelemetry(StringRedisTemplate redisTemplate,
+                          ObjectMapper objectMapper,
+                          AgentTraceRepository traceRepository) {
         this.redisTemplate = redisTemplate;
         this.objectMapper = objectMapper;
+        this.traceRepository = traceRepository;
     }
 
     public String start(Long taskId, String goal) {
@@ -55,12 +63,88 @@ public class AgentTelemetry {
                     });
         }
         String traceId = UUID.randomUUID().toString();
-        traces.put(traceId, new TraceData(traceId, taskId, goalDigest, taskKey));
+        traces.put(traceId, new TraceData(
+                traceId, UUID.randomUUID().toString(), taskId, null,
+                "INTERACTIVE", System.currentTimeMillis(), goalDigest, taskKey));
         latestTraceByTask.put(taskKey, traceId);
         currentTrace.set(traceId);
         persist(traces.get(traceId));
         log.info("agent_trace traceId={} taskId={} stage=START status=SUCCESS", traceId, taskId);
         return traceId;
+    }
+
+    /** 在任务进入 MQ 前创建 Trace，使排队时间也属于同一条链路。 */
+    public TraceContext startTask(Long mediaId,
+                                  Long userId,
+                                  String goal,
+                                  AnalysisMode mode,
+                                  String taskType) {
+        String traceId = UUID.randomUUID().toString();
+        String executionTaskId = UUID.randomUUID().toString();
+        long submittedAt = System.currentTimeMillis();
+        String goalDigest = AnalysisTaskKeys.goalDigest(goal, mode);
+        String taskKey = taskKey(mediaId, goalDigest);
+        TraceData trace = new TraceData(
+                traceId, executionTaskId, mediaId, userId, taskType,
+                submittedAt, goalDigest, taskKey);
+        traces.put(traceId, trace);
+        latestTraceByTask.put(taskKey, traceId);
+        persist(trace);
+        log.info("agent_trace traceId={} executionTaskId={} mediaId={} stage=SUBMITTED status=SUCCESS",
+                traceId, executionTaskId, mediaId);
+        return new TraceContext(
+                traceId, executionTaskId, mediaId, userId, taskType, submittedAt);
+    }
+
+    /** 消费者恢复提交端创建的 Trace；兼容单实例内存和未来的跨实例消息传播。 */
+    public String resumeTask(TraceContext context, String goal, AnalysisMode mode) {
+        if (context == null) return start(null, goal, mode);
+        String goalDigest = AnalysisTaskKeys.goalDigest(goal, mode);
+        String taskKey = taskKey(context.mediaId(), goalDigest);
+        traces.computeIfAbsent(context.traceId(), ignored -> {
+            try {
+                Map<String, Object> persisted = traceRepository.findByTraceId(
+                        context.mediaId(), context.traceId());
+                if (persisted != null && !persisted.isEmpty()) {
+                    return TraceData.restore(context, goalDigest, taskKey, persisted);
+                }
+            } catch (RuntimeException e) {
+                // Trace 是观测能力，恢复失败不能阻止 MQ 中的真实分析任务继续执行。
+                log.warn("agent_trace_restore_failed traceId={} mediaId={}",
+                        context.traceId(), context.mediaId(), e);
+            }
+            return new TraceData(
+                    context.traceId(), context.taskId(), context.mediaId(), context.userId(),
+                    context.taskType(), context.submittedAtEpochMs(), goalDigest, taskKey);
+        });
+        latestTraceByTask.put(taskKey, context.traceId());
+        currentTrace.set(context.traceId());
+        return context.traceId();
+    }
+
+    public void recordQueueWait(String traceId, long submittedAtEpochMs) {
+        TraceData trace = traces.get(traceId);
+        if (trace == null || submittedAtEpochMs <= 0) return;
+        long endedAt = System.currentTimeMillis();
+        long durationMs = Math.max(0, endedAt - submittedAtEpochMs);
+        trace.values.put("queueDurationMs", (double) durationMs);
+        trace.addStage("QUEUE_WAIT", submittedAtEpochMs, endedAt, true);
+        persist(trace);
+    }
+
+    public void status(String traceId, String status) {
+        TraceData trace = traces.get(traceId);
+        if (trace == null) return;
+        trace.status = status;
+        persist(trace);
+    }
+
+    public void finish(String traceId, String status) {
+        TraceData trace = traces.get(traceId);
+        if (trace == null) return;
+        trace.status = status;
+        trace.finishedAt = Instant.now();
+        persist(trace);
     }
 
     public void bind(String traceId) {
@@ -81,10 +165,12 @@ public class AgentTelemetry {
         if (trace == null) return;
         long durationMs = (System.nanoTime() - startedNanos) / 1_000_000;
         trace.stageDurations.merge(stage, durationMs, Long::sum);
+        long endedAt = System.currentTimeMillis();
+        trace.addStage(stage, Math.max(0, endedAt - durationMs), endedAt, success);
         trace.increment(stage + "Calls", 1);
         if (!success) trace.increment("failedStages", 1);
         log.info("agent_trace traceId={} taskId={} stage={} durationMs={} status={}",
-                traceId, trace.taskId, stage, durationMs, success ? "SUCCESS" : "FAILED");
+                traceId, trace.executionTaskId, stage, durationMs, success ? "SUCCESS" : "FAILED");
         persist(trace);
     }
 
@@ -101,6 +187,10 @@ public class AgentTelemetry {
 
     public void valueCurrent(String metric, double value) {
         String traceId = currentTrace.get();
+        value(traceId, metric, value);
+    }
+
+    public void value(String traceId, String metric, double value) {
         TraceData trace = traceId == null ? null : traces.get(traceId);
         if (trace != null) trace.values.put(metric, value);
     }
@@ -110,9 +200,30 @@ public class AgentTelemetry {
         if (traceId != null) stage(traceId, stage, startedNanos, false);
     }
 
+    /**
+     * 聚合外部工具调用指标，不逐次写入时间线，避免长视频的 OCR/ASR 明细撑大 Trace。
+     */
+    public void toolCall(String traceId, String tool, long startedNanos, boolean success) {
+        TraceData trace = traceId == null ? null : traces.get(traceId);
+        if (trace == null || tool == null || tool.isBlank()) return;
+        long durationMs = Math.max(0, (System.nanoTime() - startedNanos) / 1_000_000);
+        String prefix = "tool." + tool.trim().toUpperCase();
+        trace.increment("toolCalls", 1);
+        trace.increment(prefix + ".calls", 1);
+        trace.increment(prefix + (success ? ".successes" : ".failures"), 1);
+        trace.values.merge(prefix + ".durationMsTotal", (double) durationMs, Double::sum);
+        trace.values.merge(prefix + ".durationMsMax", (double) durationMs, Math::max);
+    }
+
+    public void toolCallCurrent(String tool, long startedNanos, boolean success) {
+        toolCall(currentTrace.get(), tool, startedNanos, success);
+    }
+
     public void modelCall(String stage,
                           String prompt,
                           String response,
+                          Long reportedInputTokens,
+                          Long reportedOutputTokens,
                           double inputPricePerMillion,
                           double outputPricePerMillion,
                           long startedNanos) {
@@ -120,11 +231,21 @@ public class AgentTelemetry {
         TraceData trace = traceId == null ? null : traces.get(traceId);
         if (trace == null) return;
 
-        long inputTokens = estimateTokens(prompt);
-        long outputTokens = estimateTokens(response);
+        boolean usageReported = reportedInputTokens != null && reportedInputTokens >= 0
+                && reportedOutputTokens != null && reportedOutputTokens >= 0;
+        long inputTokens = usageReported ? reportedInputTokens : estimateTokens(prompt);
+        long outputTokens = usageReported ? reportedOutputTokens : estimateTokens(response);
         trace.increment("modelCalls", 1);
-        trace.increment("inputTokensEstimated", inputTokens);
-        trace.increment("outputTokensEstimated", outputTokens);
+        trace.increment("inputTokens", inputTokens);
+        trace.increment("outputTokens", outputTokens);
+        trace.increment("totalTokens", inputTokens + outputTokens);
+        if (usageReported) {
+            trace.increment("tokenUsageReportedCalls", 1);
+        } else {
+            trace.increment("tokenUsageEstimatedCalls", 1);
+            trace.increment("inputTokensEstimated", inputTokens);
+            trace.increment("outputTokensEstimated", outputTokens);
+        }
         trace.estimatedCost.add(
                 inputTokens * inputPricePerMillion / 1_000_000D
                         + outputTokens * outputPricePerMillion / 1_000_000D);
@@ -137,8 +258,7 @@ public class AgentTelemetry {
         return trace == null
                 ? new BudgetUsage(0, 0)
                 : new BudgetUsage(
-                trace.counterValue("inputTokensEstimated")
-                        + trace.counterValue("outputTokensEstimated"),
+                trace.counterValue("totalTokens"),
                 trace.estimatedCost.sum());
     }
 
@@ -160,13 +280,37 @@ public class AgentTelemetry {
                         latestTraceKey(taskId, goalDigest));
             }
             String snapshot = traceId == null ? null : redisTemplate.opsForValue().get(traceKey(traceId));
-            return snapshot == null
-                    ? Map.of()
-                    : objectMapper.readValue(snapshot, new TypeReference<Map<String, Object>>() { });
+            if (snapshot != null) {
+                return objectMapper.readValue(
+                        snapshot, new TypeReference<Map<String, Object>>() { });
+            }
         } catch (Exception e) {
             log.warn("agent_trace_read_failed taskId={}", taskId, e);
+        }
+        try {
+            return traceRepository.findLatest(taskId, goalDigest);
+        } catch (RuntimeException e) {
+            log.warn("agent_trace_mysql_read_failed taskId={}", taskId, e);
             return Map.of();
         }
+    }
+
+    public Map<String, Object> byTraceId(Long mediaId, String traceId) {
+        TraceData trace = traces.get(traceId);
+        if (trace != null && java.util.Objects.equals(trace.mediaId, mediaId)) return trace.snapshot();
+        return traceRepository.findByTraceId(mediaId, traceId);
+    }
+
+    public Map<String, Object> byTaskId(Long mediaId, String taskId) {
+        TraceData trace = traces.values().stream()
+                .filter(item -> java.util.Objects.equals(item.mediaId, mediaId)
+                        && item.executionTaskId.equals(taskId))
+                .findFirst().orElse(null);
+        return trace == null ? traceRepository.findByTaskId(mediaId, taskId) : trace.snapshot();
+    }
+
+    public List<Map<String, Object>> byMediaId(Long mediaId, int limit) {
+        return traceRepository.findByMediaId(mediaId, Math.max(1, Math.min(limit, 100)));
     }
 
     public void deleteTask(Long taskId) {
@@ -192,19 +336,40 @@ public class AgentTelemetry {
             log.warn("agent_trace_cleanup_failed taskId={}", taskId, e);
         }
         traceIds.forEach(traces::remove);
+        try {
+            traceRepository.deleteByMediaId(taskId);
+        } catch (RuntimeException e) {
+            log.warn("agent_trace_mysql_cleanup_failed taskId={}", taskId, e);
+        }
     }
 
     private void persist(TraceData trace) {
+        String snapshot;
+        try {
+            snapshot = objectMapper.writeValueAsString(trace.snapshot());
+        } catch (Exception e) {
+            log.warn("agent_trace_serialize_failed traceId={} mediaId={}", trace.traceId, trace.mediaId, e);
+            return;
+        }
+        try {
+            traceRepository.upsert(
+                    trace.traceId, trace.executionTaskId, trace.mediaId, trace.userId,
+                    trace.taskType, trace.goalDigest, trace.status,
+                    trace.submittedAtEpochMs, snapshot);
+        } catch (RuntimeException e) {
+            log.warn("agent_trace_mysql_persist_failed traceId={} mediaId={}",
+                    trace.traceId, trace.mediaId, e);
+        }
         try {
             redisTemplate.opsForValue().set(
-                    traceKey(trace.traceId), objectMapper.writeValueAsString(trace.snapshot()), TRACE_TTL);
-            String latestKey = latestTraceKey(trace.taskId, trace.goalDigest);
+                    traceKey(trace.traceId), snapshot, TRACE_TTL);
+            String latestKey = latestTraceKey(trace.mediaId, trace.goalDigest);
             redisTemplate.opsForValue().set(
                     latestKey, trace.traceId, TRACE_TTL);
-            redisTemplate.opsForSet().add(traceIndexKey(trace.taskId), latestKey);
-            redisTemplate.expire(traceIndexKey(trace.taskId), TRACE_TTL);
+            redisTemplate.opsForSet().add(traceIndexKey(trace.mediaId), latestKey);
+            redisTemplate.expire(traceIndexKey(trace.mediaId), TRACE_TTL);
         } catch (Exception e) {
-            log.warn("agent_trace_persist_failed traceId={} taskId={}", trace.traceId, trace.taskId, e);
+            log.warn("agent_trace_persist_failed traceId={} mediaId={}", trace.traceId, trace.mediaId, e);
         }
     }
 
@@ -233,20 +398,49 @@ public class AgentTelemetry {
 
     private static class TraceData {
         private final String traceId;
-        private final Long taskId;
+        private final String executionTaskId;
+        private final Long mediaId;
+        private final Long userId;
+        private final String taskType;
+        private final long submittedAtEpochMs;
         private final String goalDigest;
         private final String taskKey;
-        private final Instant startedAt = Instant.now();
+        private final Instant startedAt;
         private final Map<String, Long> stageDurations = new ConcurrentHashMap<>();
         private final Map<String, LongAdder> counters = new ConcurrentHashMap<>();
         private final Map<String, Double> values = new ConcurrentHashMap<>();
+        private final List<Map<String, Object>> stageTimeline = new CopyOnWriteArrayList<>();
         private final DoubleAdder estimatedCost = new DoubleAdder();
+        private volatile String status = "RUNNING";
+        private volatile Instant finishedAt;
 
-        private TraceData(String traceId, Long taskId, String goalDigest, String taskKey) {
+        private TraceData(String traceId,
+                          String executionTaskId,
+                          Long mediaId,
+                          Long userId,
+                          String taskType,
+                          long submittedAtEpochMs,
+                          String goalDigest,
+                          String taskKey) {
             this.traceId = traceId;
-            this.taskId = taskId;
+            this.executionTaskId = executionTaskId;
+            this.mediaId = mediaId;
+            this.userId = userId;
+            this.taskType = taskType;
+            this.submittedAtEpochMs = submittedAtEpochMs;
             this.goalDigest = goalDigest;
             this.taskKey = taskKey;
+            this.startedAt = Instant.ofEpochMilli(submittedAtEpochMs);
+        }
+
+        private void addStage(String stage, long startedAt, long finishedAt, boolean success) {
+            Map<String, Object> event = new LinkedHashMap<>();
+            event.put("stage", stage);
+            event.put("startedAt", Instant.ofEpochMilli(startedAt));
+            event.put("finishedAt", Instant.ofEpochMilli(finishedAt));
+            event.put("durationMs", Math.max(0, finishedAt - startedAt));
+            event.put("status", success ? "SUCCESS" : "FAILED");
+            stageTimeline.add(event);
         }
 
         private void increment(String metric, long amount) {
@@ -263,14 +457,62 @@ public class AgentTelemetry {
             counters.forEach((key, value) -> counterSnapshot.put(key, value.sum()));
             Map<String, Object> result = new LinkedHashMap<>();
             result.put("traceId", traceId);
-            result.put("taskId", taskId);
+            result.put("taskId", executionTaskId);
+            result.put("mediaId", mediaId);
+            result.put("userId", userId);
+            result.put("taskType", taskType);
             result.put("goalDigest", goalDigest);
+            result.put("submittedAt", Instant.ofEpochMilli(submittedAtEpochMs));
             result.put("startedAt", startedAt);
+            result.put("finishedAt", finishedAt);
+            result.put("status", status);
             result.put("stageDurationMs", new LinkedHashMap<>(stageDurations));
+            result.put("stageTimeline", List.copyOf(stageTimeline));
             result.put("counters", counterSnapshot);
             result.put("values", new LinkedHashMap<>(values));
             result.put("estimatedCost", estimatedCost.sum());
             return result;
+        }
+
+        @SuppressWarnings("unchecked")
+        private static TraceData restore(TraceContext context,
+                                         String goalDigest,
+                                         String taskKey,
+                                         Map<String, Object> snapshot) {
+            TraceData trace = new TraceData(
+                    context.traceId(), context.taskId(), context.mediaId(), context.userId(),
+                    context.taskType(), context.submittedAtEpochMs(), goalDigest, taskKey);
+            Object status = snapshot.get("status");
+            if (status != null) trace.status = status.toString();
+            Object finishedAt = snapshot.get("finishedAt");
+            if (finishedAt != null) trace.finishedAt = Instant.parse(finishedAt.toString());
+            Object durations = snapshot.get("stageDurationMs");
+            if (durations instanceof Map<?, ?> values) values.forEach((key, value) -> {
+                if (key != null && value instanceof Number number) {
+                    trace.stageDurations.put(key.toString(), number.longValue());
+                }
+            });
+            Object counters = snapshot.get("counters");
+            if (counters instanceof Map<?, ?> values) values.forEach((key, value) -> {
+                if (key != null && value instanceof Number number) {
+                    trace.increment(key.toString(), number.longValue());
+                }
+            });
+            Object metricValues = snapshot.get("values");
+            if (metricValues instanceof Map<?, ?> values) values.forEach((key, value) -> {
+                if (key != null && value instanceof Number number) {
+                    trace.values.put(key.toString(), number.doubleValue());
+                }
+            });
+            Object timeline = snapshot.get("stageTimeline");
+            if (timeline instanceof List<?> entries) entries.forEach(entry -> {
+                if (entry instanceof Map<?, ?> event) {
+                    trace.stageTimeline.add(new LinkedHashMap<>((Map<String, Object>) event));
+                }
+            });
+            Object cost = snapshot.get("estimatedCost");
+            if (cost instanceof Number number) trace.estimatedCost.add(number.doubleValue());
+            return trace;
         }
     }
 }

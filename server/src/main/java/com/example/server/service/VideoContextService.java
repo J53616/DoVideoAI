@@ -231,10 +231,13 @@ public class VideoContextService {
             previousHash = imageHash;
             long timestampMs = i < timestamps.size() ? timestamps.get(i) : i * FALLBACK_FRAME_INTERVAL_MS;
             String ocrText;
+            long ocrStarted = System.nanoTime();
             try {
                 telemetry.increment(traceId, "ocrCalls", 1);
                 ocrText = ocrUtils.recognize(frameFiles.get(i).toFile());
+                telemetry.toolCall(traceId, "OCR", ocrStarted, true);
             } catch (RuntimeException e) {
+                telemetry.toolCall(traceId, "OCR", ocrStarted, false);
                 failedFrames++;
                 telemetry.increment(traceId, "ocrFrameFailures", 1);
                 log.warn("ocr_frame_failed frame={} timestampMs={}",
