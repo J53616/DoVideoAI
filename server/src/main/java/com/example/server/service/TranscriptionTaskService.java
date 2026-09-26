@@ -107,6 +107,8 @@ public class TranscriptionTaskService {
             case FAILED -> TaskStatus.of(state, "文字提取失败，请稍后重试");
             case QUEUED -> TaskStatus.of(state, "文字提取任务已排队");
             case PROCESSING -> TaskStatus.of(state, "正在提取文字");
+            case RETRYING -> TaskStatus.of(state, "文字提取任务正在重试");
+            case CANCELLED -> TaskStatus.of(state, "文字提取任务已取消");
             case NOT_STARTED -> TaskStatus.of(state, "尚未提交文字提取任务");
         };
     }

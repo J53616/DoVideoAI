@@ -141,7 +141,7 @@ async function consumeStream(body, onEvent, signal) {
         if (!data) continue
         const event = JSON.parse(data)
         await onEvent(event)
-        if (event.state === 'COMPLETED' || event.state === 'FAILED') return true
+        if (event.state === 'COMPLETED' || event.state === 'FAILED' || event.state === 'CANCELLED') return true
       }
       if (done) return false
     }

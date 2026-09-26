@@ -7,6 +7,8 @@ public record TaskEvent(TaskStatus.State state, String result, String message, T
     }
 
     public boolean terminal() {
-        return state == TaskStatus.State.COMPLETED || state == TaskStatus.State.FAILED;
+        return state == TaskStatus.State.COMPLETED
+                || state == TaskStatus.State.FAILED
+                || state == TaskStatus.State.CANCELLED;
     }
 }

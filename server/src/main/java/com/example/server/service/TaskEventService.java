@@ -35,10 +35,14 @@ public class TaskEventService implements MessageListener {
             new ConcurrentHashMap<>();
     private final StringRedisTemplate redisTemplate;
     private final ObjectMapper objectMapper;
+    private final AnalysisTaskService analysisTaskService;
 
-    public TaskEventService(StringRedisTemplate redisTemplate, ObjectMapper objectMapper) {
+    public TaskEventService(StringRedisTemplate redisTemplate,
+                            ObjectMapper objectMapper,
+                            AnalysisTaskService analysisTaskService) {
         this.redisTemplate = redisTemplate;
         this.objectMapper = objectMapper;
+        this.analysisTaskService = analysisTaskService;
     }
 
     public SseEmitter subscribe(Long mediaId,
@@ -74,6 +78,7 @@ public class TaskEventService implements MessageListener {
                                 AnalysisMode mode,
                                 TaskStatus status,
                                 TaskStage stage) {
+        analysisTaskService.stageLatest(mediaId, AnalysisTaskKeys.goalDigest(goal, mode), stage);
         publish(key(mediaId, ANALYSIS, goal, mode), TaskEvent.of(status, stage));
     }
 

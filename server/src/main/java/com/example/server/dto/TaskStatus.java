@@ -6,8 +6,10 @@ public record TaskStatus(State state, String result, String message) {
         NOT_STARTED,
         QUEUED,
         PROCESSING,
+        RETRYING,
         COMPLETED,
-        FAILED
+        FAILED,
+        CANCELLED
     }
 
     public static TaskStatus of(State state, String message) {

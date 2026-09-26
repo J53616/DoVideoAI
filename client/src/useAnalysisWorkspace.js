@@ -203,7 +203,7 @@ export function useAnalysisWorkspace({
         // 收到任何事件都说明连接是通的，先把“重连中”提示撤掉。
         sidebar.value.streamOffline = false
         sidebar.value.streamRetry = 0
-        if (status.message && (status.state === 'PROCESSING' || status.state === 'QUEUED')) {
+        if (status.message && ['PROCESSING', 'QUEUED', 'RETRYING'].includes(status.state)) {
           sidebar.value.statusMessage = status.message
         }
       }
@@ -215,6 +215,8 @@ export function useAnalysisWorkspace({
         await finish(status.result || (type === 'ai' ? '分析完成' : ''))
       } else if (status.state === 'FAILED') {
         await finish(status.message || '任务执行失败', true)
+      } else if (status.state === 'CANCELLED') {
+        await finish(status.message || '任务已取消', true)
       }
     }, (error, attempt, terminal = false) => {
       // isCurrentTask 保证用户已切换视频或关闭面板时，旧任务的错误不会写到新页面上。
@@ -265,7 +267,7 @@ export function useAnalysisWorkspace({
         }
         return
       }
-      if (currentStatus.state === 'QUEUED' || currentStatus.state === 'PROCESSING') {
+      if (['QUEUED', 'PROCESSING', 'RETRYING'].includes(currentStatus.state)) {
         if (isCurrentWorkspace(id, 'text') && currentStatus.message) {
           sidebar.value.statusMessage = currentStatus.message
         }
@@ -365,13 +367,13 @@ export function useAnalysisWorkspace({
         sidebar.value.content = status.result || ''
         sidebar.value.loading = false
         await refreshAgentMeta(item.id, goal, true, analysisMode)
-      } else if (status.state === 'QUEUED' || status.state === 'PROCESSING') {
+      } else if (['QUEUED', 'PROCESSING', 'RETRYING'].includes(status.state)) {
         sidebar.value.mode = 'result'
         sidebar.value.loading = true
         sidebar.value.statusMessage = status.message || '正在恢复上一次未完成的分析任务'
         startTaskStream(item.id, 'ai', goal, analysisMode)
         await refreshAgentMeta(item.id, goal, false, analysisMode)
-      } else if (status.state === 'FAILED') {
+      } else if (status.state === 'FAILED' || status.state === 'CANCELLED') {
         sidebar.value.error = status.message || '上次分析未完成，可以重新提交'
       }
     } catch (error) {

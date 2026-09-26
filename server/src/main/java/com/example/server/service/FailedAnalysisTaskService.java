@@ -6,6 +6,7 @@ import com.example.server.dto.AnalysisTaskMsg;
 import com.example.server.dto.TaskStatus;
 import com.example.server.dto.TaskStage;
 import com.example.server.entity.FailedAnalysisTask;
+import com.example.server.entity.AnalysisTask;
 import com.example.server.mapper.FailedAnalysisTaskMapper;
 import com.example.server.utils.AnalysisTaskKeys;
 import org.apache.rocketmq.spring.core.RocketMQTemplate;
@@ -41,18 +42,24 @@ public class FailedAnalysisTaskService {
     private final RocketMQTemplate rocketMQTemplate;
     private final StringRedisTemplate redisTemplate;
     private final TaskEventService taskEventService;
+    private final AnalysisTaskService analysisTaskService;
+    private final AgentTelemetry telemetry;
     private final String analysisTopic;
 
     public FailedAnalysisTaskService(FailedAnalysisTaskMapper taskMapper,
                                      RocketMQTemplate rocketMQTemplate,
                                      StringRedisTemplate redisTemplate,
                                      TaskEventService taskEventService,
+                                     AnalysisTaskService analysisTaskService,
+                                     AgentTelemetry telemetry,
                                      @Value("${rocketmq.topic.video-analysis:video-analysis-topic}")
                                      String analysisTopic) {
         this.taskMapper = taskMapper;
         this.rocketMQTemplate = rocketMQTemplate;
         this.redisTemplate = redisTemplate;
         this.taskEventService = taskEventService;
+        this.analysisTaskService = analysisTaskService;
+        this.telemetry = telemetry;
         this.analysisTopic = analysisTopic;
     }
 
@@ -117,8 +124,19 @@ public class FailedAnalysisTaskService {
         boolean dispatched = false;
         try {
             redisTemplate.delete(AnalysisTaskKeys.attempts(contentHash, goalDigest));
-            rocketMQTemplate.convertAndSend(analysisTopic, new AnalysisTaskMsg(
-                    task.getMediaId(), task.getAction(), contentHash, task.getUserGoal(), mode.name()));
+            AnalysisTask previous = analysisTaskService.latest(task.getMediaId(), goalDigest);
+            if (previous == null || previous.getUserId() == null) {
+                throw new IllegalStateException("找不到原任务归属，无法安全重放");
+            }
+            var trace = telemetry.startTask(task.getMediaId(), previous.getUserId(),
+                    task.getUserGoal(), mode, task.getAction());
+            AnalysisTaskMsg replay = new AnalysisTaskMsg(task.getMediaId(), task.getAction(),
+                    contentHash, task.getUserGoal(), mode.name(), trace);
+            if (!analysisTaskService.create(replay, goalDigest)) {
+                throw new IllegalArgumentException("相同任务正在处理中");
+            }
+            rocketMQTemplate.convertAndSend(analysisTopic, replay);
+            analysisTaskService.queued(trace.taskId());
             dispatched = true;
             task.setStatus(STATUS_REQUEUED);
             task.setUpdatedAt(LocalDateTime.now());

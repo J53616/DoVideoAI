@@ -4,6 +4,8 @@ import com.example.server.dto.AgentState;
 import com.example.server.dto.AnalysisMode;
 import com.example.server.dto.TaskStage;
 import com.example.server.dto.TaskStatus;
+import com.example.server.entity.AnalysisTask;
+import com.example.server.utils.AnalysisTaskKeys;
 import org.springframework.stereotype.Service;
 
 @Service
@@ -11,11 +13,14 @@ public class AnalysisStatusService {
 
     private final AgentCheckpointService checkpointService;
     private final AnalysisDispatchService dispatchService;
+    private final AnalysisTaskService analysisTaskService;
 
     public AnalysisStatusService(AgentCheckpointService checkpointService,
-                                 AnalysisDispatchService dispatchService) {
+                                 AnalysisDispatchService dispatchService,
+                                 AnalysisTaskService analysisTaskService) {
         this.checkpointService = checkpointService;
         this.dispatchService = dispatchService;
+        this.analysisTaskService = analysisTaskService;
     }
 
     public TaskStatus current(Long mediaId, String goal) {
@@ -23,10 +28,18 @@ public class AnalysisStatusService {
     }
 
     public TaskStatus current(Long mediaId, String goal, AnalysisMode mode) {
+        AnalysisTask task = analysisTaskService.latest(
+                mediaId, AnalysisTaskKeys.goalDigest(goal, mode));
+        boolean succeeded = task != null && AnalysisTaskService.SUCCEEDED.equals(task.getStatus());
+        if (task != null) {
+            TaskStatus persisted = fromTask(task);
+            if (persisted != null) return persisted;
+        }
         AgentState result = checkpointService.loadResult(mediaId, goal, mode);
         if (result != null && result.result() != null) {
             return TaskStatus.completed(result);
         }
+        if (succeeded) return TaskStatus.of(TaskStatus.State.COMPLETED, "任务完成");
 
         TaskStage stage = checkpointService.loadStage(mediaId, goal, mode);
         if (dispatchService.isActive(mediaId, goal, mode)) {
@@ -47,7 +60,31 @@ public class AnalysisStatusService {
     }
 
     public TaskStage stage(Long mediaId, String goal, AnalysisMode mode) {
+        AnalysisTask task = analysisTaskService.latest(
+                mediaId, AnalysisTaskKeys.goalDigest(goal, mode));
+        if (task != null && task.getCurrentStage() != null) {
+            return TaskStage.from(task.getCurrentStage());
+        }
         return checkpointService.loadStage(mediaId, goal, mode);
+    }
+
+    private TaskStatus fromTask(AnalysisTask task) {
+        return switch (task.getStatus()) {
+            case AnalysisTaskService.SUBMITTED, AnalysisTaskService.QUEUED ->
+                    TaskStatus.of(TaskStatus.State.QUEUED, "任务已排队");
+            case AnalysisTaskService.RUNNING ->
+                    TaskStatus.of(TaskStatus.State.PROCESSING,
+                            statusMessage(TaskStage.from(task.getCurrentStage())));
+            case AnalysisTaskService.RETRYING ->
+                    TaskStatus.of(TaskStatus.State.RETRYING, "任务执行异常，正在自动重试");
+            case AnalysisTaskService.CANCELLED ->
+                    TaskStatus.of(TaskStatus.State.CANCELLED, "任务已取消");
+            case AnalysisTaskService.FAILED, AnalysisTaskService.DEAD_LETTERED ->
+                    TaskStatus.of(TaskStatus.State.FAILED,
+                            task.getErrorMessage() == null ? "分析失败，请稍后重试" : task.getErrorMessage());
+            case AnalysisTaskService.SUCCEEDED -> null; // 从 checkpoint 返回最终结果
+            default -> null;
+        };
     }
 
     private String statusMessage(TaskStage stage) {

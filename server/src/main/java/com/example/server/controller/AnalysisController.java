@@ -5,6 +5,7 @@ import com.example.server.common.Result;
 import com.example.server.dto.AgentFeedback;
 import com.example.server.dto.AgentState;
 import com.example.server.dto.AnalysisMode;
+import com.example.server.dto.AnalysisTaskView;
 import com.example.server.dto.RouteDecision;
 import com.example.server.dto.RouteRequest;
 import com.example.server.dto.TaskStatus;
@@ -14,6 +15,7 @@ import com.example.server.exception.BusinessException;
 import com.example.server.service.AgentCheckpointService;
 import com.example.server.service.AnalysisDispatchService;
 import com.example.server.service.AnalysisStatusService;
+import com.example.server.service.AnalysisTaskService;
 import com.example.server.service.AgentEvaluationService;
 import com.example.server.service.AgentTelemetry;
 import com.example.server.service.AiService;
@@ -31,6 +33,7 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestAttribute;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
@@ -57,6 +60,7 @@ public class AnalysisController {
     private final TaskEventService taskEventService;
     private final AnalysisStatusService statusService;
     private final ModeRouter modeRouter;
+    private final AnalysisTaskService analysisTaskService;
     private final Executor aiTaskExecutor;
 
     public AnalysisController(AiService aiService,
@@ -67,6 +71,7 @@ public class AnalysisController {
                               MediaService mediaService,
                               TaskEventService taskEventService,
                               AnalysisStatusService statusService,
+                              AnalysisTaskService analysisTaskService,
                               ModeRouter modeRouter,
                               @Qualifier("aiTaskExecutor") Executor aiTaskExecutor) {
         this.aiService = aiService;
@@ -77,6 +82,7 @@ public class AnalysisController {
         this.mediaService = mediaService;
         this.taskEventService = taskEventService;
         this.statusService = statusService;
+        this.analysisTaskService = analysisTaskService;
         this.modeRouter = modeRouter;
         this.aiTaskExecutor = aiTaskExecutor;
     }
@@ -194,6 +200,34 @@ public class AnalysisController {
         mediaService.requireOwnedMedia(id, userId);
         String normalizedGoal = normalizeText(goal, "分析目标");
         return Result.ok(statusService.current(id, normalizedGoal, AnalysisMode.fromRequest(mode)));
+    }
+
+    @GetMapping("/tasks/{taskId}")
+    public Result<AnalysisTaskView> task(
+            @PathVariable String taskId,
+            @RequestAttribute(AuthService.REQUEST_USER_ID) Long userId) {
+        return Result.ok(AnalysisTaskView.from(analysisTaskService.requireOwned(taskId, userId)));
+    }
+
+    @GetMapping("/tasks/latest")
+    public Result<AnalysisTaskView> latestTask(
+            @RequestParam Long id,
+            @RequestParam String goal,
+            @RequestParam(required = false) String mode,
+            @RequestAttribute(AuthService.REQUEST_USER_ID) Long userId) {
+        mediaService.requireOwnedMedia(id, userId);
+        var task = analysisTaskService.latest(id, com.example.server.utils.AnalysisTaskKeys.goalDigest(
+                normalizeText(goal, "分析目标"), AnalysisMode.fromRequest(mode)));
+        if (task == null) throw new java.util.NoSuchElementException("分析任务不存在");
+        return Result.ok(AnalysisTaskView.from(task));
+    }
+
+    @PostMapping("/tasks/{taskId}/cancel")
+    public ResponseEntity<Result<Void>> cancelTask(
+            @PathVariable String taskId,
+            @RequestAttribute(AuthService.REQUEST_USER_ID) Long userId) {
+        analysisTaskService.cancel(taskId, userId);
+        return ResponseEntity.accepted().body(Result.ok());
     }
 
     @GetMapping(value = "/analysis-events", produces = MediaType.TEXT_EVENT_STREAM_VALUE)

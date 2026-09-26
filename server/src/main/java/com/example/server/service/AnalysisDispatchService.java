@@ -38,6 +38,7 @@ public class AnalysisDispatchService {
     private final RedissonClient redissonClient;
     private final TaskEventService taskEventService;
     private final AgentTelemetry telemetry;
+    private final AnalysisTaskService analysisTaskService;
     private final String analysisTopic;
 
     public AnalysisDispatchService(AiService aiService,
@@ -47,6 +48,7 @@ public class AnalysisDispatchService {
                                    RedissonClient redissonClient,
                                    TaskEventService taskEventService,
                                    AgentTelemetry telemetry,
+                                   AnalysisTaskService analysisTaskService,
                                    @Value("${rocketmq.topic.video-analysis:video-analysis-topic}")
                                    String analysisTopic) {
         this.aiService = aiService;
@@ -56,6 +58,7 @@ public class AnalysisDispatchService {
         this.redissonClient = redissonClient;
         this.taskEventService = taskEventService;
         this.telemetry = telemetry;
+        this.analysisTaskService = analysisTaskService;
         this.analysisTopic = analysisTopic;
     }
 
@@ -76,7 +79,14 @@ public class AnalysisDispatchService {
         String activeKey = AnalysisTaskKeys.active(contentHash, goalDigest);
         Boolean accepted = redisTemplate.opsForValue().setIfAbsent(
                 activeKey, String.valueOf(mediaId), ACTIVE_TTL);
-        if (!Boolean.TRUE.equals(accepted)) return SubmissionResult.DUPLICATE;
+        if (!Boolean.TRUE.equals(accepted)) {
+            if (analysisTaskService.hasActive(mediaId, goalDigest)) return SubmissionResult.DUPLICATE;
+            // MySQL 已无活动任务时，Redis 中只是过期前残留的协调键。
+            redisTemplate.delete(activeKey);
+            accepted = redisTemplate.opsForValue().setIfAbsent(
+                    activeKey, String.valueOf(mediaId), ACTIVE_TTL);
+            if (!Boolean.TRUE.equals(accepted)) return SubmissionResult.DUPLICATE;
+        }
 
         TraceContext traceContext = telemetry.startTask(
                 mediaId, mediaFile.getUserId(), goal, resolvedMode, action);
@@ -88,15 +98,22 @@ public class AnalysisDispatchService {
                 telemetry.finish(traceContext.traceId(), "RATE_LIMITED");
                 return SubmissionResult.RATE_LIMITED;
             }
+            AnalysisTaskMsg message = new AnalysisTaskMsg(
+                    mediaId, action, contentHash, goal, resolvedMode.name(), traceContext);
+            if (!analysisTaskService.create(message, goalDigest)) {
+                redisTemplate.delete(activeKey);
+                telemetry.stage(traceContext.traceId(), "DISPATCH", dispatchStarted, false);
+                telemetry.finish(traceContext.traceId(), "DUPLICATE");
+                return SubmissionResult.DUPLICATE;
+            }
             // 旧结果先留着。消费者真正接手后再切 Checkpoint，MQ 投递失败时用户还有结果可看。
             if (revision != null) aiService.stageRevision(revision, resolvedMode);
-            rocketMQTemplate.convertAndSend(
-                    analysisTopic,
-                    new AnalysisTaskMsg(
-                            mediaId, action, contentHash, goal, resolvedMode.name(), traceContext));
+            analysisTaskService.queued(traceContext.taskId());
+            rocketMQTemplate.convertAndSend(analysisTopic, message);
         } catch (RuntimeException e) {
             redisTemplate.delete(activeKey);
             if (revision != null) aiService.cancelStagedRevision(mediaId, goal, resolvedMode);
+            analysisTaskService.failed(traceContext.taskId(), TaskStage.DISPATCH_FAILED, e);
             telemetry.stage(traceContext.traceId(), "DISPATCH", dispatchStarted, false);
             telemetry.finish(traceContext.traceId(), "DISPATCH_FAILED");
             log.error("analysis_dispatch_failed mediaId={} userId={}", mediaId, mediaFile.getUserId(), e);
